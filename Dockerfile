@@ -25,11 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the project (secrets like .env are excluded via .dockerignore).
 COPY . .
 
-# The base image ships a non-root "playwright" user (uid 1000) — run as it.
-# /app must be writable because the bot saves its TikTok session state
-# (playwright_storage.json) into the working directory.
-RUN chmod +x /app/docker-entrypoint.sh && chown -R playwright:playwright /app
-USER playwright
+RUN chmod +x /app/docker-entrypoint.sh
 
 # The bot reads .env from the project root (python-dotenv) and connects to
 # Telegram + Supabase using the variables injected by docker-compose.
