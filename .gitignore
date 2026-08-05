@@ -31,6 +31,7 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
 
 # typescript
@@ -41,3 +42,17 @@ example
 # generated native folders
 /ios
 /android
+
+# Python / bot runtime
+__pycache__/
+*.pyc
+.venv/
+venv/
+playwright_storage.json
+cookies.txt
+*.log
+metro_bundle_fresh.js
+page_structure_*.txt
+page_structure_*.png
+debug_screenshot_*.png
+_profile_page.png

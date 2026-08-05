@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Python dependencies for the Telegram bot + TikTok scraping (Docker/cloud).
+# Mirrors scripts/requirements.txt plus anything imported lazily by the bot.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Playwright (headless browser automation) — version must match the
+# mcr.microsoft.com/playwright/python base image tag in the Dockerfile.
+playwright>=1.61.0
+
+# Telegram bot framework (python-telegram-bot v22+)
+python-telegram-bot>=22.8
+
+# Supabase client (database + storage)
+supabase>=2.0.0
+
+# HTTP clients
+httpx>=0.27.0
+curl-cffi>=0.15.0
+
+# Video download fallback
+yt-dlp>=2026.7.23.234303
+
+# .env loading
+python-dotenv>=1.0.0
+
+# (kept for parity with scripts/requirements.txt)
+fastapi>=0.115.0
+uvicorn>=0.32.0

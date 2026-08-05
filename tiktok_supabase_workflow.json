@@ -1,0 +1,313 @@
+{
+  "name": "TikTok → Supabase Importer",
+  "nodes": [
+    {
+      "id": "webhook-trigger-001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "webhookId": "tiktok-auto",
+      "parameters": {
+        "path": "webhook/tiktok-auto",
+        "httpMethod": "POST",
+        "options": {
+          "rawBody": true
+        },
+        "responseMode": "onReceived",
+        "responseData": "firstNodeJson"
+      }
+    },
+    {
+      "id": "rapidapi-scrape-002",
+      "name": "RapidAPI Scrape",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [280, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": []
+        },
+        "options": {
+          "headers": {
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "x-rapidapi-key",
+                  "value": "={{ $credentials.rapidapi.apiKey }}"
+                },
+                {
+                  "name": "x-rapidapi-host",
+                  "value": "tiktok-downloader-download-tiktok-videos-no-watermark.p.rapidapi.com"
+                }
+              ]
+            }
+          },
+          "query": {
+            "parameters": [
+              {
+                "name": "url",
+                "value": "={{ $json.url }}"
+              },
+              {
+                "name": "hd",
+                "value": "1"
+              }
+            ]
+          }
+        },
+        "sendQuery": true,
+        "sendHeaders": true,
+        "sendBodyFormat": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": "RapidAPI"
+      }
+    },
+    {
+      "id": "process-upload-003",
+      "name": "Process & Upload to Storage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 300],
+      "parameters": {
+        "language": "javaScript",
+        "code": "// ==============================================================\n// n8n Code Node: Parse TikTok metadata + upload to Supabase Storage\n// ==============================================================\n// CONFIG — set these to match your Supabase project\nconst SUPABASE_URL = 'https://ojiaowvkdyoiebgejkxj.supabase.co';\nconst SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9qaWFvd3ZrZHlvaWViZ2Vqa3hqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NTA1NTA3MywiZXhwIjoyMTAwNjMxMDczfQ.0-Cqd4NZIgZejWD_WO-KZla-Xj-PYxlJIqRGFXjB-Aw';\nconst BUCKET       = 'videos';\n// ==============================================================\n\nconst https = require('https');\nconst { URL: UrlClass } = require('url');\n\n// ---- Helpers ---------------------------------------------------\n\nfunction parseEpisode(title) {\n  const cleaned = (title || '').replace(/\\s*[—\\-–]\\s*(♬.*|original sound.*|sonido original.*)$/i, '').trim();\n  const patterns = [\n    /^(.+?)\\s*EP\\.?\\s*(\\d+)/i,\n    /^(.+?)\\s+[—\\-–]\\s*(?:Ep|Episode)\\s*(\\d+)/i,\n    /^(.+?)\\s+Eps?\\s*(\\d+)/i,\n    /^(.+?)\\s+#\\s*(\\d+)/,\n    /^(.+?)\\s+Part\\s*(\\d+)/i,\n  ];\n  for (const pat of patterns) {\n    const m = pat.exec(cleaned);\n    if (m) return [m[1].trim().replace(/[.,:; ]+$/, ''), parseInt(m[2], 10)];\n  }\n  return [cleaned, null];\n}\n\nfunction slugId(name) {\n  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || 'series';\n}\n\nfunction httpsGet(url) {\n  return new Promise((resolve, reject) => {\n    https.get(url, { followRedirects: true, timeout: 60000 }, (res) => {\n      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {\n        httpsGet(res.headers.location).then(resolve).catch(reject);\n        return;\n      }\n      const chunks = [];\n      res.on('data', (c) => chunks.push(c));\n      res.on('end', () => resolve(Buffer.concat(chunks)));\n      res.on('error', reject);\n    }).on('error', reject);\n  });\n}\n\nfunction httpsPost(url, data, headers) {\n  return new Promise((resolve, reject) => {\n    const u = new UrlClass(url);\n    const opts = {\n      hostname: u.hostname,\n      port: u.port || 443,\n      path: u.pathname + (u.search || ''),\n      method: 'POST',\n      headers: { ...headers, 'Content-Length': Buffer.byteLength(data) },\n    };\n    const req = https.request(opts, (res) => {\n      const chunks = [];\n      res.on('data', (c) => chunks.push(c));\n      res.on('end', () => {\n        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }\n        catch { resolve({ raw: Buffer.concat(chunks).toString() }); }\n      });\n    });\n    req.on('error', reject);\n    req.write(data);\n    req.end();\n  });\n}\n\n// ---- Main -------------------------------------------------------\n\nconst input = $input.first().json;\n\n// Flatten: RapidAPI responses vary by provider — normalise\nconst item = input.data || input;\nconst title       = item.title || item.desc || '';\nconst description = item.description || item.desc || title;\nconst videoUrl    = item.video_url || (item.video && item.video.url) || item.url || '';\nconst thumbnail   = item.thumbnail || item.cover || item.thumbnail_url || '';\nconst username    = item.username || item.author || item.unique_id || '';\nconst duration    = parseInt(item.duration || item.video_duration || '30', 10);\n\n// Parse series title + episode number\nlet [seriesTitle, episodeNum] = parseEpisode(title);\n\n// Fallback: use @username as series title if parsed title is garbage\nif (!seriesTitle || /^(untitled|video|)$/i.test(seriesTitle)) {\n  seriesTitle = username ? `@${username}` : 'Untitled';\n}\n\nconst seriesSlug = slugId(seriesTitle);\nconst episodeId  = `ep-${seriesSlug}-${episodeNum || 'X'}`;\n\n// ---- Duplicate check: query Supabase episodes table ------------\nlet alreadyExists = false;\nif (episodeNum !== null && episodeNum !== undefined) {\n  try {\n    const checkUrl = `${SUPABASE_URL}/rest/v1/episodes?id=eq.${encodeURIComponent(episodeId)}&select=id&limit=1`;\n    const checkBody = await httpsGet(checkUrl);\n    const checkResult = JSON.parse(checkBody.toString());\n    alreadyExists = Array.isArray(checkResult) && checkResult.length > 0;\n  } catch (e) {\n    // If Supabase check fails, assume new so we don't skip\n  }\n}\n\n// ---- Upload video + thumbnail to Supabase Storage ----------------\nlet videoStorageUrl  = videoUrl;\nlet thumbStorageUrl  = thumbnail;\n\nif (!alreadyExists && videoUrl) {\n  try {\n    // Download video\n    const videoBuf = await httpsGet(videoUrl);\n    const videoKey = `${seriesSlug}/video_${episodeNum || '0'}.mp4`;\n    const uploadResp = await httpsPost(\n      `${SUPABASE_URL}/storage/v1/object/${BUCKET}/${videoKey}`,\n      videoBuf,\n      {\n        'Content-Type': 'video/mp4',\n        'apikey': SUPABASE_KEY,\n        'Authorization': `Bearer ${SUPABASE_KEY}`,\n      }\n    );\n    videoStorageUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${videoKey}`;\n\n    // Download + upload thumbnail if available\n    if (thumbnail) {\n      const thumbBuf = await httpsGet(thumbnail);\n      const ext = thumbnail.match(/\\.(png|jpe?g|webp)/i)?.[1]?.replace(/jpe?g/, 'jpg') || 'jpg';\n      const thumbKey = `${seriesSlug}/thumb_${episodeNum || '0'}.${ext}`;\n      await httpsPost(\n        `${SUPABASE_URL}/storage/v1/object/${BUCKET}/${thumbKey}`,\n        thumbBuf,\n        {\n          'Content-Type': `image/${ext === 'jpg' ? 'jpeg' : ext}`,\n          'apikey': SUPABASE_KEY,\n          'Authorization': `Bearer ${SUPABASE_KEY}`,\n        }\n      );\n      thumbStorageUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${thumbKey}`;\n    }\n  } catch (e) {\n    // Fallback: keep original URLs\n  }\n}\n\n// ---- Return -----------------------------------------------------\nreturn [{\n  json: {\n    // Original metadata\n    webpage_url:   item.webpage_url || item.url || '',\n    title:         title,\n    description:   description,\n    duration:      Math.max(1, Math.ceil(duration / 60)),\n    username:      username,\n    // Parsed series / episode\n    series_title:   seriesTitle,\n    series_slug:    seriesSlug,\n    episode_number: episodeNum,\n    episode_id:     episodeId,\n    // Storage URLs (either Supabase or original)\n    video_url:      videoStorageUrl,\n    thumbnail_url:  thumbStorageUrl,\n    // Dup flag for IF node\n    already_exists: alreadyExists,\n  }\n}];"
+      }
+    },
+    {
+      "id": "if-dup-check-004",
+      "name": "Already Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [840, 300],
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.already_exists }}",
+              "operation": "equal",
+              "value2": "false"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "noop-skip-005",
+      "name": "Skip (duplicate)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [840, 500],
+      "parameters": {}
+    },
+    {
+      "id": "upsert-series-006",
+      "name": "Upsert Series",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.supabaseUrl }}/rest/v1/series",
+        "authentication": "genericCredentialType",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "id",
+              "value": "={{ $node['Process & Upload to Storage'].json.series_slug }}"
+            },
+            {
+              "name": "title",
+              "value": "={{ $node['Process & Upload to Storage'].json.series_title }}"
+            },
+            {
+              "name": "genre",
+              "value": "={{ $node['Process & Upload to Storage'].json.genre || 'Sci-Fi' }}"
+            },
+            {
+              "name": "description",
+              "value": "={{ $node['Process & Upload to Storage'].json.description }}"
+            },
+            {
+              "name": "poster_url",
+              "value": "={{ $node['Process & Upload to Storage'].json.thumbnail_url }}"
+            },
+            {
+              "name": "banner_url",
+              "value": "={{ $node['Process & Upload to Storage'].json.thumbnail_url }}"
+            },
+            {
+              "name": "episode_count",
+              "value": "={{ $node['Process & Upload to Storage'].json.episode_number || 1 }}"
+            }
+          ]
+        },
+        "options": {
+          "headers": {
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Prefer",
+                  "value": "resolution=merge-duplicates"
+                }
+              ]
+            }
+          }
+        },
+        "sendQuery": false,
+        "sendBodyFormat": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": "Supabase API"
+      }
+    },
+    {
+      "id": "upsert-episode-007",
+      "name": "Upsert Episode",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.supabaseUrl }}/rest/v1/episodes",
+        "authentication": "genericCredentialType",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "id",
+              "value": "={{ $node['Process & Upload to Storage'].json.episode_id }}"
+            },
+            {
+              "name": "series_id",
+              "value": "={{ $node['Process & Upload to Storage'].json.series_slug }}"
+            },
+            {
+              "name": "episode_number",
+              "value": "={{ $node['Process & Upload to Storage'].json.episode_number }}"
+            },
+            {
+              "name": "title",
+              "value": "={{ $node['Process & Upload to Storage'].json.title }}"
+            },
+            {
+              "name": "description",
+              "value": "={{ $node['Process & Upload to Storage'].json.description }}"
+            },
+            {
+              "name": "video_url",
+              "value": "={{ $node['Process & Upload to Storage'].json.video_url }}"
+            },
+            {
+              "name": "thumbnail_url",
+              "value": "={{ $node['Process & Upload to Storage'].json.thumbnail_url }}"
+            },
+            {
+              "name": "duration",
+              "value": "={{ $node['Process & Upload to Storage'].json.duration }}"
+            },
+            {
+              "name": "is_free",
+              "value": "={{ $node['Process & Upload to Storage'].json.episode_number <= 2 }}"
+            }
+          ]
+        },
+        "options": {
+          "headers": {
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Prefer",
+                  "value": "resolution=merge-duplicates"
+                }
+              ]
+            }
+          }
+        },
+        "sendQuery": false,
+        "sendBodyFormat": "json"
+      },
+      "credentials": {
+        "httpHeaderAuth": "Supabase API"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "RapidAPI Scrape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RapidAPI Scrape": {
+      "main": [
+        [
+          {
+            "node": "Process & Upload to Storage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process & Upload to Storage": {
+      "main": [
+        [
+          {
+            "node": "Already Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Exists?": {
+      "main": [
+        [
+          {
+            "node": "Upsert Series",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip (duplicate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Series": {
+      "main": [
+        [
+          {
+            "node": "Upsert Episode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "versionId": "1",
+  "active": false,
+  "settings": {
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "staticData": null
+}

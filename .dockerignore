@@ -1,0 +1,28 @@
+# Secrets — never enter the image or the registry
+.env
+.env.*
+!.env.example
+
+# TikTok session (mounted as a volume instead)
+playwright_storage.json
+
+# VCS / local tooling
+.git
+.gitignore
+*.md
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node / Expo app (not needed on the bot server)
+node_modules
+.expo
+dist
+web-build
+
+# Playwright local browser downloads
+playwright_downloads/
+ms-playwright/

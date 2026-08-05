@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 24/7 Cloud deployment — TikTok → Supabase Telegram bot.
+#
+# Usage:
+#   1. Make sure `.env` exists at the project root with the secrets:
+#        TELEGRAM_BOT_TOKEN
+#        EXPO_PUBLIC_SUPABASE_URL
+#        SUPABASE_SERVICE_ROLE_KEY
+#      (keep the file chmod 600 — it is gitignored and .dockerignored)
+#   2. Create the TikTok session file if missing (the bot re-writes it):
+#        touch playwright_storage.json
+#   3. docker compose up -d --build
+#      docker compose logs -f bot
+#
+# TikTok session persistence: playwright_storage.json is bind-mounted so the
+# login cookies survive container rebuilds.  To refresh the session, run the
+# one-time login locally (python scripts/login_tiktok.py) and upload the file
+# to the server — or docker compose exec bot python scripts/login_tiktok.py
+# with a visible browser (needs X11/VNC on the host).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  bot:
+    build: .
+    container_name: tiktok-bot
+    restart: unless-stopped
+    env_file:
+      # Secrets stay out of the image/registry — read straight from .env.
+      - .env
+    environment:
+      # Force UTC so log timestamps are consistent across hosts.
+      TZ: UTC
+    volumes:
+      # TikTok login session (cookies + localStorage) — survives restarts.
+      # The entrypoint creates the file if Docker made a directory on the
+      # very first run.
+      - ./playwright_storage.json:/app/playwright_storage.json
+    # Memory settings: Chromium needs /dev/shm — give it a real tmpfs size
+    # (the default 64MB causes headless crashes) plus a container RAM cap.
+    shm_size: 1gb
+    mem_limit: 2g
+    cpus: 2.0
+    init: true
+    stop_grace_period: 30s
+    healthcheck:
+      # True while a "telegram_bot" python process is running (excludes the
+      # healthcheck process itself).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import glob,os; me=str(os.getpid()); alive=any(b'telegram_bot' in open(p,'rb').read() for p in glob.glob('/proc/*/cmdline') if p.split('/')[2]!=me); raise SystemExit(0 if alive else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
