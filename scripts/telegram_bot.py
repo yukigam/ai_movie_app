@@ -25,6 +25,9 @@ import sys
 import time
 
 import tempfile
+import threading
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from dotenv import load_dotenv
@@ -45,6 +48,41 @@ try:
 except Exception:
     pass
 log = logging.getLogger("ttbot")
+
+# ── Render keep-alive HTTP server (deployment only, no bot logic) ────────────
+# Render kills a Web Service if its port stays silent, and a polling bot never
+# accepts connections.  This minimal built-in server answers 200 OK on the
+# Render-provided PORT from a daemon thread in the background.  It starts ONLY
+# when this file is run as a script (python scripts/telegram_bot.py); module
+# imports (test_pipeline, tiktok_webhook, clean_and_redownload) are unaffected.
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802  (stdlib naming)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def start_health_server() -> None:
+    """Start the Render keep-alive HTTP server on $PORT in a daemon thread."""
+    port = int(os.environ.get("PORT", "8000"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except Exception as e:
+        log.warning("! Health server on port %s failed to start: %s", port, e)
+        return
+    threading.Thread(
+        target=server.serve_forever, daemon=True, name="render-health"
+    ).start()
+    log.info("✓ Render health server listening on 0.0.0.0:%s", port)
+
+
+if __name__ == "__main__":
+    start_health_server()
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
