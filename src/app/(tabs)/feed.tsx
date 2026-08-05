@@ -5,6 +5,7 @@ import {
   Text,
   FlatList,
   Pressable,
+  Share,
   Dimensions,
   StyleSheet,
   ListRenderItemInfo,
@@ -87,6 +88,19 @@ export default function FeedScreen() {
   const handleLike = useCallback((episodeId: string) => {
     setLikedEpisodes((prev) => ({ ...prev, [episodeId]: !prev[episodeId] }));
   }, []);
+
+  const handleShare = useCallback(
+    (seriesTitle: string, episodeNumber?: number) => {
+      try {
+        Share.share({
+          message: `Энэ киног үзээрэй: ${seriesTitle} (EP ${episodeNumber ?? '?'})\nЛинкаар орж үзэх: https://ai-movie-app.onrender.com`,
+        });
+      } catch (error) {
+        console.log((error as Error).message);
+      }
+    },
+    []
+  );
 
   const handleSelectEpisode = useCallback(
     (episode: Episode) => {
@@ -209,7 +223,10 @@ export default function FeedScreen() {
                   </Text>
                 </Pressable>
 
-                <Pressable style={styles.actionButton}>
+                <Pressable
+                  style={styles.actionButton}
+                  onPress={() => handleShare(series.title, ep.episodeNumber)}
+                >
                   <Text style={styles.actionIcon}>↗</Text>
                   <Text style={styles.actionLabel}>Share</Text>
                 </Pressable>
@@ -240,6 +257,7 @@ export default function FeedScreen() {
       unlockedEpisodes,
       insets.top,
       handleLike,
+      handleShare,
       handleWatchAd,
       isLoaded,
       seriesMap,
