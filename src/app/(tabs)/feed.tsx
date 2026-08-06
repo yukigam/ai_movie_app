@@ -35,6 +35,7 @@ export default function FeedScreen() {
   const [error, setError] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(true);
+  const [showControls, setShowControls] = useState(false);
   const [likedEpisodes, setLikedEpisodes] = useState<Record<string, boolean>>({});
   const [unlockedEpisodes, setUnlockedEpisodes] = useState<Record<string, boolean>>({});
   const [modalVisible, setModalVisible] = useState(false);
@@ -128,6 +129,27 @@ export default function FeedScreen() {
     setIsPlaying(true);
   }, [activeIndex]);
 
+  const controlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (controlsTimer.current) clearTimeout(controlsTimer.current);
+    if (showControls) {
+      controlsTimer.current = setTimeout(() => setShowControls(false), 3000);
+    }
+    return () => {
+      if (controlsTimer.current) clearTimeout(controlsTimer.current);
+    };
+  }, [showControls]);
+
+  const resetControlsTimer = useCallback(() => {
+    if (controlsTimer.current) clearTimeout(controlsTimer.current);
+    controlsTimer.current = setTimeout(() => setShowControls(false), 3000);
+  }, []);
+
+  const handleToggleControls = useCallback(() => {
+    setShowControls((prev) => !prev);
+  }, []);
+
   const handleTogglePlay = useCallback(() => {
     const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
     if (!handle) return;
@@ -137,15 +159,17 @@ export default function FeedScreen() {
       handle.play();
     }
     setIsPlaying((prev) => !prev);
-  }, [activeItem, isPlaying]);
+    resetControlsTimer();
+  }, [activeItem, isPlaying, resetControlsTimer]);
 
   const handleSeekBy = useCallback(
     (seconds: number) => {
       const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
       if (!handle) return;
       handle.seekBy(seconds);
+      resetControlsTimer();
     },
-    [activeItem]
+    [activeItem, resetControlsTimer]
   );
 
   useEffect(() => {
@@ -206,20 +230,23 @@ export default function FeedScreen() {
             isActive={isActive}
           />
 
-          <View style={styles.overlay}>
-            <View style={[styles.topBar, { paddingTop: insets.top + 12 }]}>
+          <Pressable style={styles.tapLayer} onPress={handleToggleControls} />
+
+          {showControls && (
+            <View style={[styles.topBar, { paddingTop: insets.top + 12 }]} pointerEvents="none">
               <Text style={styles.brandText}>AI Series</Text>
             </View>
+          )}
 
-            <View style={styles.controlsLayer}>
-              {!isPlaying && (
-                <Pressable style={styles.centerPlayButton} onPress={handleTogglePlay}>
-                  <Text style={styles.centerPlayIcon}>▶</Text>
-                </Pressable>
-              )}
-            </View>
+          {!isPlaying && (
+            <Pressable style={styles.centerPlayButton} onPress={handleTogglePlay}>
+              <Text style={styles.centerPlayIcon}>▶</Text>
+            </Pressable>
+          )}
 
-            <View style={styles.controlsRow}>
+          {showControls && (
+            <View style={styles.controlsBottom}>
+              <View style={styles.controlsRow}>
               <Pressable
                 style={styles.controlButton}
                 onPress={() => handleSeekBy(-10)}
@@ -267,43 +294,47 @@ export default function FeedScreen() {
                   </Pressable>
                 )}
               </View>
+            </View>
+            </View>
+          )}
 
-              <View style={styles.actionArea}>
-                <Pressable
-                  style={styles.actionButton}
-                  onPress={() => handleLike(item.episode.id)}
-                >
-                  <Text style={[styles.actionIcon, isLiked && styles.actionIconActive]}>
-                    {isLiked ? '♥' : '♡'}
-                  </Text>
-                  <Text style={styles.actionLabel}>
-                    {isLiked ? 'Liked' : 'Like'}
-                  </Text>
-                </Pressable>
+          <View
+            style={[styles.actionRail, { bottom: showControls ? 220 : 60 }]}
+            pointerEvents="box-none"
+          >
+            <Pressable
+              style={styles.actionButton}
+              onPress={() => handleLike(item.episode.id)}
+            >
+              <Text style={[styles.actionIcon, isLiked && styles.actionIconActive]}>
+                {isLiked ? '♥' : '♡'}
+              </Text>
+              <Text style={styles.actionLabel}>
+                {isLiked ? 'Liked' : 'Like'}
+              </Text>
+            </Pressable>
 
-                <Pressable
-                  style={styles.actionButton}
-                  onPress={() => handleShare(series.title, ep.episodeNumber)}
-                >
-                  <Text style={styles.actionIcon}>↗</Text>
-                  <Text style={styles.actionLabel}>Share</Text>
-                </Pressable>
+            <Pressable
+              style={styles.actionButton}
+              onPress={() => handleShare(series.title, ep.episodeNumber)}
+            >
+              <Text style={styles.actionIcon}>↗</Text>
+              <Text style={styles.actionLabel}>Share</Text>
+            </Pressable>
 
-                <Pressable
-                  style={styles.actionButton}
-                  onPress={() => setModalVisible(true)}
-                >
-                  <Text style={styles.actionIcon}>☰</Text>
-                  <Text style={styles.actionLabel}>Episodes</Text>
-                </Pressable>
+            <Pressable
+              style={styles.actionButton}
+              onPress={() => setModalVisible(true)}
+            >
+              <Text style={styles.actionIcon}>☰</Text>
+              <Text style={styles.actionLabel}>Episodes</Text>
+            </Pressable>
 
-                <View style={styles.actionButton}>
-                  <Text style={styles.actionIcon}>▶</Text>
-                  <Text style={styles.actionLabel}>
-                    {formatCount(series.playCount)}
-                  </Text>
-                </View>
-              </View>
+            <View style={styles.actionButton}>
+              <Text style={styles.actionIcon}>▶</Text>
+              <Text style={styles.actionLabel}>
+                {formatCount(series.playCount)}
+              </Text>
             </View>
           </View>
         </View>
@@ -319,8 +350,10 @@ export default function FeedScreen() {
       handleWatchAd,
       handleTogglePlay,
       handleSeekBy,
+      handleToggleControls,
       isPlaying,
       isLoaded,
+      showControls,
       seriesMap,
     ]
   );
@@ -432,20 +465,31 @@ const styles = StyleSheet.create({
     height: SCREEN_HEIGHT,
     backgroundColor: '#000',
   },
-  overlay: {
+  tapLayer: {
     ...StyleSheet.absoluteFill,
-    justifyContent: 'space-between',
   },
   topBar: {
     paddingHorizontal: 16,
     paddingBottom: 8,
   },
-  controlsLayer: {
-    flex: 1,
-    justifyContent: 'center',
+  controlsBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  actionRail: {
+    position: 'absolute',
+    right: 12,
     alignItems: 'center',
+    gap: 16,
   },
   centerPlayButton: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    marginTop: -36,
+    marginLeft: -36,
     width: 72,
     height: 72,
     borderRadius: 36,
@@ -542,11 +586,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     letterSpacing: 0.5,
-  },
-  actionArea: {
-    alignItems: 'center',
-    gap: 16,
-    marginLeft: 12,
   },
   actionButton: {
     alignItems: 'center',
