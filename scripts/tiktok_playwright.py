@@ -54,6 +54,89 @@ def _storage_exists() -> bool:
     return os.path.isfile(STORAGE_STATE)
 
 
+# ── Session from a Netscape cookies.txt ──────────────────────────────────────
+# On hosts where the Playwright storage JSON isn't available on disk, the
+# TikTok login session can be injected as a Netscape-format cookies.txt
+# (Render: "Secret Files", mounted into the container).  This lets the
+# headless browser start logged-in — an anonymous datacenter session makes
+# TikTok show a CAPTCHA puzzle and the episode sidebar never renders, which
+# used to yield "only 1 episode" instead of the full series.
+COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", str(PROJECT_ROOT / "cookies.txt"))
+SECRET_COOKIES_CANDIDATES = [
+    COOKIES_FILE,
+    str(Path("/app/cookies.txt")),
+    str(Path("/etc/secret_files/cookies.txt")),
+    str(Path("/etc/secrets/cookies.txt")),
+]
+
+
+def _cookies_file() -> str | None:
+    """Path of the first cookies.txt that actually exists, or None."""
+    seen = set()
+    for p in SECRET_COOKIES_CANDIDATES:
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _parse_netscape_cookies(path: str) -> list[dict]:
+    """Parse a Netscape HTTP cookie file into Playwright storage cookies."""
+    cookies = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, _dom_flag, path_v, secure_flag, expires, name, value = parts[:7]
+                if "tiktok" not in domain and "byte" not in domain:
+                    continue
+                cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": path_v or "/",
+                    "expires": float(expires) if expires.lstrip("-").isdigit() else 1893456000,
+                    "httpOnly": ("httponly" in line.lower()),
+                    "secure": secure_flag.lower() == "true",
+                    "sameSite": "Lax",
+                })
+    except Exception as e:
+        log.warning("Failed to parse cookies.txt %s: %s", path, e)
+        return []
+    return cookies
+
+
+def _load_storage_state() -> dict | None:
+    """Return the best available TikTok session as Playwright storage state.
+
+    Prefers the saved ``playwright_storage.json``; falls back to building one
+    from an injected ``cookies.txt`` (so Render works without committing the
+    session to the public repo).  Returns None only when no session exists.
+    """
+    if _storage_exists():
+        try:
+            with open(STORAGE_STATE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("cookies"):
+                return data
+        except Exception as e:
+            log.warning("Could not read %s: %s", STORAGE_STATE, e)
+    cf = _cookies_file()
+    if cf:
+        cookies = _parse_netscape_cookies(cf)
+        if cookies:
+            log.info("Loaded TikTok session from %s (%d cookies)", cf, len(cookies))
+            return {"cookies": cookies, "origins": []}
+    return None
+
+
 async def _random_sleep(min_s: float = 3.0, max_s: float = 7.0):
     """Sleep a random interval between *min_s* and *max_s* seconds.
     
@@ -93,7 +176,7 @@ async def create_playwright_context(p, headless: bool = True):
         viewport={"width": 1400, "height": 900},
         locale="en-US",
         timezone_id="America/New_York",
-        storage_state=STORAGE_STATE if _storage_exists() else None,
+        storage_state=_load_storage_state(),
     )
 
     # Remove webdriver detection + mimic real browser
@@ -187,7 +270,7 @@ async def _wait_for_grid(page, timeout: int = 30) -> list:
     deadline = time.monotonic() + timeout
     class_patterns = ['DivEpisodeGrid', 'EpisodeList', 'EpisodeSidebar',
                       'DivPlaylistContainer', 'DivSeriesContainer',
-                      'DivEpisodeContainer', 'EpisodeItem']
+                      'DivEpisodeContainer', 'EpisodeItem', 'ButtonEpisode']
     while time.monotonic() < deadline:
         # Strategy 1: class name patterns (returns child coords from the grid)
         found = await page.evaluate(f"""() => {{
@@ -858,15 +941,28 @@ _SIDEBAR_FIND_JS = """() => {
 _GRID_FIND_JS = f"""() => {{
     const patterns = {json.dumps(['DivEpisodeGrid', 'EpisodeList', 'EpisodeSidebar',
                                   'DivPlaylistContainer', 'DivSeriesContainer',
-                                  'DivEpisodeContainer', 'EpisodeItem'])};
+                                  'DivEpisodeContainer', 'EpisodeItem',
+                                  'ButtonEpisode', 'PlaylistContainer'])};
     // After a video navigation TikTok re-renders the sidebar and keeps the
     // OLD grid in the DOM underneath the NEW one.  Always return the LAST
     // matching grid — the fresh, topmost instance.
     let found = null;
+    let foundScore = 0;
     for (const el of document.querySelectorAll('*')) {{
         const c = el.className || '';
         if (typeof c === 'string' && patterns.some(p => c.includes(p))) {{
-            if (el.children.length > 0) found = el;
+            // Score by the number of VISIBLE children so a grid of real
+            // episode buttons beats a parent/child container with the same
+            // class fragment.
+            let vis = 0;
+            for (let i = 0; i < el.children.length; i++) {{
+                const r = el.children[i].getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) vis++;
+            }}
+            if (vis > foundScore) {{
+                found = el;
+                foundScore = vis;
+            }}
         }}
     }}
     if (found) return found;
@@ -1153,8 +1249,10 @@ async def _click_tab_buttons(page) -> list:
     tabs = await page.evaluate("""() => {
         const seenText = new Set();
         const tabs = [];
-        // Only look at actual buttons and anchor tags (not div/spans that contain child buttons)
-        const all = document.querySelectorAll('button, a');
+        // Tab buttons may be <button>/<a> or role-based elements (TikTok
+        // sometimes renders them as plain divs) — scan broadly, dedupe by
+        // label text so the same label is only used once.
+        const all = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
         for (const el of all) {
             const t = (el.textContent || '').trim();
             // Tab pattern: "1-24", "25-40", etc.
@@ -1198,7 +1296,7 @@ async def _click_tab_buttons(page) -> list:
 
         # Click the tab
         clicked_tab = await page.evaluate(f"""() => {{
-            const all = document.querySelectorAll('button, a');
+            const all = document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]');
             for (const el of all) {{
                 const t = (el.textContent || '').trim();
                 if (/^\\d+\\s*-\\s*\\d+$/.test(t) && t === {json.dumps(tab['text'])}) {{
@@ -1415,6 +1513,25 @@ async def _click_episode_item(page, item: dict, ep_num: int, old_url: str, usern
     loc = (page.locator('[class*="ButtonEpisode"]:visible')
               .filter(has_text=re.compile(f"^{re.escape(text)}$")).last)
     try:
+        loc_count = await loc.count()
+    except Exception:
+        loc_count = 0
+    if loc_count == 0:
+        # Class renamed / different layout: fall back to a real mouse click
+        # at the item's grid coordinates (captured when the grid was read).
+        x, y = item.get("x"), item.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            log.warning("EP %d: no ButtonEpisode locator and no coordinates — cannot click", ep_num)
+            return None
+        log.info("EP %d: ButtonEpisode locator missing — clicking coordinates (%s, %s)", ep_num, x, y)
+        try:
+            await page.mouse.click(float(x), float(y))
+        except Exception as e:
+            log.warning("EP %d: coordinate click failed: %s", ep_num, str(e)[:80])
+            return None
+        log.info("Clicked sidebar item %s (EP %d) via coordinates, waiting for video change...", text, ep_num)
+        return await _wait_for_video_change(page, old_url, timeout=12.0)
+    try:
         await loc.scroll_into_view_if_needed(timeout=5000)
     except Exception:
         pass
@@ -1587,9 +1704,17 @@ async def extract_episodes(
                 log.warning("Login/CAPTCHA wall detected — body preview: %.200s", body_preview)
                 await _dump_page_structure(page, "login-wall")
                 log.warning("Session is rate-limited. Run: python scripts/login_tiktok.py")
-                for attempt in range(3):
+                # CAPTCHAs are transient (they usually clear within minutes).
+                # Retry patiently with growing backoff instead of giving up
+                # after 3 quick refreshes — giving up early is what used to
+                # produce the "only 1 episode" result (the sidebar never
+                # renders behind the puzzle, so only the URL's own video is
+                # returned).
+                captcha_window_start = time_module.monotonic()
+                for attempt in range(6):
+                    log.info("CAPTCHA bypass attempt %d/6 — reloading main page...", attempt + 1)
                     await page.goto("https://www.tiktok.com", timeout=30000, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(5000)
+                    await page.wait_for_timeout(6000)
                     try:
                         await page.wait_for_function(
                             "() => { const s = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__'); return s && s.textContent.length > 100; }",
@@ -1597,23 +1722,30 @@ async def extract_episodes(
                         )
                         log.info("Session detected on TikTok main page (rehydration data present)")
                     except Exception:
-                        log.warning("No rehydration data on main page (attempt %d/3)", attempt + 1)
+                        log.warning("No rehydration data on main page (attempt %d/6)", attempt + 1)
 
                     try:
                         await page.goto(url, timeout=60000, wait_until="domcontentloaded")
                     except Exception as e:
                         log.warning("Navigation timeout on retry %d: %s", attempt + 1, e)
-                    await page.wait_for_timeout(5000)
+                    await page.wait_for_timeout(6000)
                     login_wall = await _check_login_wall()
                     if not login_wall:
                         log.info("Login wall bypassed after refresh attempt %d", attempt + 1)
                         await save_storage(context)
                         break
-                    log.warning("Login wall persists (attempt %d/3)", attempt + 1)
-                    if attempt < 2:
-                        await asyncio.sleep(5)
+                    log.warning("Login wall persists (attempt %d/6)", attempt + 1)
+                    if attempt < 5:
+                        backoff = 20 + attempt * 10 + random.randint(0, 10)
+                        log.info("Waiting %ds before next CAPTCHA retry...", backoff)
+                        await asyncio.sleep(backoff)
                 else:
-                    log.warning("Login wall persists after all refresh attempts — continuing anyway")
+                    # Total ~4-6 min of patient retries did not clear it —
+                    # proceed anyway (strategies below will just see no
+                    # sidebar and the single-video fallback will apply).
+                    log.error("CAPTCHA persisted after 6 attempts over %.0fs — continuing "
+                              "with whatever the page shows",
+                              time_module.monotonic() - captcha_window_start)
 
             # Wait for rehydration data to appear (indicates JavaScript hydration)
             await page.wait_for_timeout(3000)
@@ -1793,11 +1925,14 @@ async def extract_episodes(
             tab_texts = await page.evaluate("""() => {
                 const seenText = new Set();
                 const tabs = [];
-                for (const el of document.querySelectorAll('button, a')) {
+                for (const el of document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')) {
                     const t = (el.textContent || '').trim();
                     if (/^[0-9]+[ \t]*-[ \t]*[0-9]+$/.test(t) && !seenText.has(t)) {
-                        seenText.add(t);
-                        tabs.push(t);
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            seenText.add(t);
+                            tabs.push(t);
+                        }
                     }
                 }
                 return tabs;
@@ -1835,7 +1970,7 @@ async def extract_episodes(
                 for attempt in range(3):
                     if len(tab_texts) > 1:
                         clicked_tab = await page.evaluate(f"""() => {{
-                            for (const el of document.querySelectorAll('button, a')) {{
+                            for (const el of document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')) {{
                                 const t = (el.textContent || '').trim();
                                 if (t === {json.dumps(tab_key)}) {{
                                     const r = el.getBoundingClientRect();
@@ -1892,10 +2027,21 @@ async def extract_episodes(
                 try:
                     await page.wait_for_selector(
                         '[class*="DivEpisodeGrid"],[class*="EpisodeList"],'
-                        '[class*="EpisodeSidebar"],[data-e2e*="episode"],'
+                        '[class*="EpisodeSidebar"],[class*="ButtonEpisode"],'
+                        '[class*="DivPlaylistContainer"],[data-e2e*="episode"],'
                         '[data-e2e*="series"]',
                         timeout=15000,
                     )
+                except Exception:
+                    pass
+                # Bonus: explicitly wait until episode BUTTONS (not just the
+                # container) are attached, then give React one more beat.
+                try:
+                    await page.wait_for_selector(
+                        '[class*="ButtonEpisode"]',
+                        timeout=15000,
+                    )
+                    await page.wait_for_timeout(500)
                 except Exception:
                     pass
                 # Wait until the tab's episodes are FULLY rendered in the DOM
@@ -2100,7 +2246,7 @@ async def extract_episodes(
                 prev_marker = await _grid_marker(page)
                 if len(tab_texts) > 1:
                     clicked = await page.evaluate(f"""() => {{
-                        for (const el of document.querySelectorAll('button, a')) {{
+                        for (const el of document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')) {{
                             const t = (el.textContent || '').trim();
                             if (t === {json.dumps(tab_key)}) {{
                                 const r = el.getBoundingClientRect();

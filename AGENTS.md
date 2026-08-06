@@ -66,3 +66,30 @@ Notes:
 - Bot extracts episodes by clicking sidebar items with `page.mouse.click`
   (JS `.click()` doesn't trigger React) and waits for tab content via
   `_wait_for_tab_content` (networkidle + DOM marker change)
+
+# Render Docker session (CAPTCHA fix)
+
+A container has NO `playwright_storage.json` (gitignored, `.dockerignore`'d) → the
+bot runs headless with an **anonymous** session → TikTok serves a CAPTCHA puzzle
+and the episode sidebar never renders → *only 1 episode is extracted*.
+
+To give Render a logged-in session **without committing cookies to the public
+repo**, the bot reads a Netscape-format `cookies.txt`:
+
+- `tiktok_playwright.py` `_load_storage_state()` → prefers
+  `playwright_storage.json`, else builds `storageState` from the first
+  existing file of: `$TIKTOK_COOKIES_FILE`, `cookies.txt` (project root),
+  `/app/cookies.txt`, `/etc/secret_files/cookies.txt`, `/etc/secrets/cookies.txt`
+- Generate the seed file locally (37 cookies):
+  `python scripts/diag_sidebar.py` is NOT that — use a storage→cookies dump:
+  `python -c "import json; d=json.load(open('playwright_storage.json')); print(chr(10).join(f'.\tTRUE\t/\t{("TRUE" if c.get("secure") else "FALSE")}\t{c.get("expires") or 1893456000}\t{c["name"]}\t{c["value"]}' for c in d.get('cookies',[]) if 'tiktok' in c.get('domain','') or 'byte' in c.get('domain','')) )" > cookies.txt`
+  (or run the existing _ensure_cookies() conversion in telegram_bot.py)
+
+Render setup:
+1. Render Dashboard → service → Environment → **Secret Files** → add
+   file `cookies.txt` whose content = `scripts/../cookies.txt` contents
+2. (optional) set `TIKTOK_COOKIES_FILE` env if mounted elsewhere
+
+In-page CAPTCHAs are transient: `extract_episodes()` retries 6× with
+20–60 s backoff before giving up (the sidebar is read only after the wall
+clears). Social‑flow cues: recent-ranking: same as series extraction above.
