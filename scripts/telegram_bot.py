@@ -1031,11 +1031,17 @@ class Store:
             return False
 
     def upsert_series(self, sid: str, title: str, genre: str, desc: str, thumb: str) -> None:
-        self.db.table("series").upsert({
+        payload = {
             "id": sid, "title": title, "genre": genre,
-            "description": desc or title, "poster_url": thumb, "banner_url": thumb,
+            "description": desc or title,
             "play_count": 0, "episode_count": 0,
-        }, on_conflict="id").execute()
+        }
+        # Never overwrite an existing poster with an empty value — the
+        # series keeps its official cover from a previous import.
+        if thumb:
+            payload["poster_url"] = thumb
+            payload["banner_url"] = thumb
+        self.db.table("series").upsert(payload, on_conflict="id").execute()
 
     def episode_exists(self, sid: str, num: int) -> bool:
         r = self.db.table("episodes").select("id", count="exact").eq("id", f"ep-{sid}-{num}").execute()
@@ -1924,15 +1930,17 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
 
     final_failures = failed + broken_eps + cleanup_left
     fail_eps = ", ".join(f"EP {e[1]}" for e in final_failures[:10])
+    titles = ", ".join(touched_titles.values()) or "unknown"
     if final_failures:
         if len(final_failures) > 10:
             fail_eps += "…"
         status_line = (
             f"⚠️ *Бүрэн биш:* {len(final_failures)} анги амжилтгүй ({fail_eps}).\n"
-            f"Тэдгээрийг баазад 'pending' төлөвт тэмдэглэсэн — дараагийн импортод автоматаар нөхөгдөнө."
+            f"Киноны нэр: {titles}, Нийт оруулав: {inserted} анги\n"
+            f"Амжилтгүй ангиудыг 'pending' төлөвт тэмдэглэсэн — дараагийн импортод автоматаар нөхөгдөнө."
         )
     else:
-        status_line = "✅ *Амжилттай орууллаа!* Бүх анги татагдаж, баталгаажсан."
+        status_line = f"✅ *Амжилттай орууллаа!* Киноны нэр: {titles}, Нийт оруулав: {inserted} анги."
 
     dup_warn = (
         f"\n⚠️ {skipped} анги давхар байсан тул алгассан (зөвхөн бүрэн, эрүүл ангиуд)."
