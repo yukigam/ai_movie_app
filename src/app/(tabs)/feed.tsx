@@ -12,10 +12,10 @@ import {
   Modal,
   ActivityIndicator,
 } from 'react-native';
-import Slider from '@react-native-community/slider';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Episode, Series } from '@/types/series';
 import { VideoPlayer, VideoPlayerHandle } from '@/components/video-player';
+import { SeekBar } from '@/components/seek-bar';
 import { EpisodeModal } from '@/components/episode-modal';
 import { useRewardedAd } from '@/hooks/use-rewarded-ad';
 import { fetchFeed } from '@/lib/api';
@@ -39,8 +39,7 @@ export default function FeedScreen() {
   const [showControls, setShowControls] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [isSeeking, setIsSeeking] = useState(false);
-  const [seekPosition, setSeekPosition] = useState(0);
+  const isSeekingRef = useRef(false);
   const [likedEpisodes, setLikedEpisodes] = useState<Record<string, boolean>>({});
   const [unlockedEpisodes, setUnlockedEpisodes] = useState<Record<string, boolean>>({});
   const [modalVisible, setModalVisible] = useState(false);
@@ -183,6 +182,7 @@ export default function FeedScreen() {
     const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
     if (!handle) return;
     const id = setInterval(() => {
+      if (isSeekingRef.current) return;
       setPosition(handle.getCurrentTime());
       setDuration(handle.getDuration());
     }, 250);
@@ -271,21 +271,14 @@ export default function FeedScreen() {
           {showControls && (
             <View style={styles.controlsBottom}>
               <View style={styles.seekRow}>
-                <Text style={styles.timeText}>{formatTime(isSeeking ? seekPosition : position)}</Text>
-                <Slider
-                  style={styles.seekBar}
-                  minimumValue={0}
-                  maximumValue={Math.max(duration, 1)}
-                  value={isSeeking ? seekPosition : position}
-                  onSlidingStart={() => setIsSeeking(true)}
-                  onValueChange={setSeekPosition}
-                  onSlidingComplete={(v) => {
-                    setIsSeeking(false);
-                    handleSeekTo(v);
+                <Text style={styles.timeText}>{formatTime(position)}</Text>
+                <SeekBar
+                  position={position}
+                  duration={duration}
+                  onSeek={handleSeekTo}
+                  onSeekingChange={(seeking) => {
+                    isSeekingRef.current = seeking;
                   }}
-                  minimumTrackTintColor="#FF0000"
-                  maximumTrackTintColor="rgba(255,255,255,0.35)"
-                  thumbTintColor="#FF0000"
                 />
                 <Text style={styles.timeText}>{formatTime(duration)}</Text>
               </View>
@@ -379,8 +372,6 @@ export default function FeedScreen() {
       showControls,
       position,
       duration,
-      isSeeking,
-      seekPosition,
       seriesMap,
     ]
   );
@@ -511,11 +502,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingBottom: 4,
     gap: 8,
-  },
-  seekBar: {
-    flex: 1,
-    height: 32,
-    marginVertical: -10,
   },
   timeText: {
     color: '#fff',
