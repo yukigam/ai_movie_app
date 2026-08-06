@@ -43,7 +43,7 @@ STORAGE_STATE = str(PROJECT_ROOT / "playwright_storage.json")
 # Hard cap on how long ONE sidebar episode click may take (scroll → click →
 # wait for video change).  If TikTok's page JS hangs, asyncio.wait_for kills
 # the work and extraction moves on to the next episode.
-EPISODE_PROCESS_TIMEOUT = 20.0
+EPISODE_PROCESS_TIMEOUT = 25.0
 
 # Hard cap for processing ONE pagination tab (clicking through all its
 # episodes).  A wedged tab aborts and the browser page is recovered.
@@ -52,6 +52,27 @@ TAB_PROCESS_TIMEOUT = 300.0
 
 def _storage_exists() -> bool:
     return os.path.isfile(STORAGE_STATE)
+
+
+def clean_url(url: str) -> str:
+    """Strip tracking query parameters from a TikTok URL.
+
+    Web-share links often carry ``?is_from_webapp=1&sender_device=pc`` (or
+    ``utm_*``) — Tiktok treats those visits as web-shares and frequently
+    serves a CAPTCHA puzzle; the episode sidebar never renders, so extraction
+    comes back with only the URL's own video.  Remove the query parameters
+    before navigating.
+    """
+    if not url:
+        return url
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url.strip())
+        if not parts.scheme:
+            return url.strip()
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return url.strip()
 
 
 # ── Session from a Netscape cookies.txt ──────────────────────────────────────
@@ -1536,16 +1557,30 @@ async def _click_episode_item(page, item: dict, ep_num: int, old_url: str, usern
     except Exception:
         pass
     try:
-        await loc.click(timeout=12000)
+        await loc.click(timeout=8000)
     except Exception as e:
         log.warning("EP %d: locator click failed (%s) — dismissing overlay and retrying", ep_num, str(e)[:80])
         await _dismiss_login_overlay(page)
         await _random_sleep(1.0, 2.0)
         try:
-            await loc.click(timeout=12000)
+            # force=True skips the "another element intercepts pointer events"
+            # actionability guard — a translucent overlay (DivSectionPane /
+            # cinema side panel) frequently covers the sidebar items after a
+            # video navigation, but the underlying button still receives the
+            # click.
+            await loc.click(force=True, timeout=9000)
         except Exception as e2:
-            log.warning("EP %d: retry click failed too: %s", ep_num, str(e2)[:80])
-            return None
+            log.warning("EP %d: force click failed too (%s) — trying raw mouse click",
+                        ep_num, str(e2)[:80])
+            try:
+                await loc.scroll_into_view_if_needed(timeout=5000)
+                box = await loc.bounding_box()
+            except Exception:
+                box = None
+            if box:
+                await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            else:
+                return None
     log.info("Clicked sidebar item %s (EP %d), waiting for video change...", text, ep_num)
     return await _wait_for_video_change(page, old_url, timeout=12.0)
 
@@ -1561,6 +1596,67 @@ def _net_is_up(host: str = "www.tiktok.com", timeout: float = 4.0) -> bool:
             return True
     except OSError:
         return False
+
+
+async def _clear_login_wall(page, url: str, attempts: int = 3) -> bool:
+    """Best-effort removal of TikTok's login/CAPTCHA wall from *page*.
+
+    The wall ("Drag the slider to fit the puzzle") blocks the episode sidebar
+    and ONLY clears via a fresh load cycle: TikTok main page → wait for
+    rehydration → revisit the target URL.  Returns True when the page is
+    usable (no wall).  Never raises.
+    """
+    try:
+        wall = await page.evaluate("""() => {
+            const text = document.body?.innerText || '';
+            if (text.includes('Drag the slider to fit the puzzle')) return true;
+            if (text.includes('Log in to start watching')) return true;
+            const modal = document.querySelector('[class*="Login"], [data-e2e*="login"], [class*="SignModal"]');
+            if (modal) {
+                const r = modal.getBoundingClientRect();
+                return r.width > 100 && r.height > 100;
+            }
+            return false;
+        }""")
+    except Exception:
+        return False
+    if not wall:
+        return True
+    for attempt in range(attempts):
+        log.info("Clearing login/CAPTCHA wall (attempt %d/%d)...", attempt + 1, attempts)
+        try:
+            await page.goto("https://www.tiktok.com", timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(4000)
+            try:
+                await page.wait_for_function(
+                    "() => { const s = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__'); return s && s.textContent.length > 100; }",
+                    timeout=12000,
+                )
+            except Exception:
+                pass
+            await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(4000)
+        except Exception as e:
+            log.warning("Wall-clear navigation failed: %s", str(e)[:80])
+        try:
+            wall = await page.evaluate("""() => {
+                const text = document.body?.innerText || '';
+                if (text.includes('Drag the slider to fit the puzzle')) return true;
+                if (text.includes('Log in to start watching')) return true;
+                const modal = document.querySelector('[class*="Login"], [data-e2e*="login"], [class*="SignModal"]');
+                if (modal) {
+                    const r = modal.getBoundingClientRect();
+                    return r.width > 100 && r.height > 100;
+                }
+                return false;
+            }""")
+        except Exception:
+            return False
+        if not wall:
+            log.info("Login/CAPTCHA wall cleared after %d attempt(s)", attempt + 1)
+            return True
+        await asyncio.sleep(5)
+    return False
 
 
 async def _recover_page(page, browser, url: str, on_response=None):
@@ -1593,6 +1689,11 @@ async def _recover_page(page, browser, url: str, on_response=None):
             raise ConnectionError(f"Network is down during re-navigation: {e}")
         log.warning("Recovered page: re-navigation failed (%s) — continuing with loaded page", e)
     await asyncio.sleep(3)
+    # A fresh page is worthless if TikTok slaps a CAPTCHA on it — the
+    # sidebar never renders behind the puzzle.  Give the page a clean
+    # session before handing it back (best-effort; never raises).
+    await _clear_login_wall(new_page, url, attempts=2)
+    await asyncio.sleep(2)
     return new_page
 
 
@@ -1628,6 +1729,11 @@ async def extract_episodes(
         thread; exceptions are swallowed.
     """
     from playwright.async_api import async_playwright
+
+    # Web-share query params (is_from_webapp, sender_device, utm_*) make
+    # TikTok serve a CAPTCHA that hides the episode sidebar — never navigate
+    # with them.
+    url = clean_url(url)
 
     async with async_playwright() as p:
         browser, context = await create_playwright_context(p, headless=headless)
@@ -1964,6 +2070,30 @@ async def extract_episodes(
                 start, end = _tab_range(tab_key)
                 log.info("Processing tab %s for direct clicking...", tab_key)
 
+                # After a page recovery the sidebar re-hydrates a few seconds
+                # late.  Never attempt a tab click before it exists — that
+                # used to make "Tab X not found" abort every later tab after
+                # one crash.
+                wait_start = time_module.monotonic()
+                tab_present = False
+                while time_module.monotonic() - wait_start < 30:
+                    tab_present = await page.evaluate(f"""() => {{
+                        for (const el of document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')) {{
+                            const t = (el.textContent || '').trim();
+                            if (t === {json.dumps(tab_key)}) {{
+                                const r = el.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) return true;
+                            }}
+                        }}
+                        return false;
+                    }}""")
+                    if tab_present:
+                        break
+                    await asyncio.sleep(1.0)
+                if not tab_present:
+                    log.warning("Tab %s never appeared within 30s — returning 0", tab_key)
+                    return 0
+
                 # Click the tab (retry until the grid content actually switches)
                 switched = len(tab_texts) <= 1  # single tab: already active
                 prev_marker = await _grid_marker(page)
@@ -2190,7 +2320,7 @@ async def extract_episodes(
                     try:
                         page = await asyncio.wait_for(
                             _recover_page(page, browser, url, on_response),
-                            timeout=30.0,
+                            timeout=90.0,
                         )
                     except Exception as rec_e:
                         log.error("Page recovery failed: %s", rec_e)
@@ -2439,6 +2569,8 @@ async def extract_video_url(
     all other methods (ssstik.io, TikWM, yt-dlp) fail.
     """
     from playwright.async_api import async_playwright
+
+    url = clean_url(url)
 
     async with async_playwright() as p:
         browser, context = await create_playwright_context(p, headless=headless)

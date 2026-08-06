@@ -164,6 +164,10 @@ def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
     if not _playwright_available():
         log.info("Playwright storage not found — skipping series extraction")
         return []
+    # Web-share tracking params (is_from_webapp, sender_device, utm_*) make
+    # TikTok serve a CAPTCHA — strip them BEFORE navigating (this was the
+    # "only 1 episode" root cause).
+    url = _clean_url(url)
     if not os.path.isfile(PLAYWRIGHT_STORAGE):
         log.info("No saved login state — extraction runs without TikTok session (fresh headless context)")
     try:
