@@ -14,7 +14,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Episode, Series } from '@/types/series';
-import { VideoPlayer } from '@/components/video-player';
+import { VideoPlayer, VideoPlayerHandle } from '@/components/video-player';
 import { EpisodeModal } from '@/components/episode-modal';
 import { useRewardedAd } from '@/hooks/use-rewarded-ad';
 import { fetchFeed } from '@/lib/api';
@@ -34,10 +34,12 @@ export default function FeedScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(true);
   const [likedEpisodes, setLikedEpisodes] = useState<Record<string, boolean>>({});
   const [unlockedEpisodes, setUnlockedEpisodes] = useState<Record<string, boolean>>({});
   const [modalVisible, setModalVisible] = useState(false);
   const adDataRef = useRef<{ seriesId: string; episodeId: string } | null>(null);
+  const videoRefs = useRef<Record<string, VideoPlayerHandle | null>>({});
 
   useEffect(() => {
     (async () => {
@@ -123,6 +125,30 @@ export default function FeedScreen() {
   );
 
   useEffect(() => {
+    setIsPlaying(true);
+  }, [activeIndex]);
+
+  const handleTogglePlay = useCallback(() => {
+    const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
+    if (!handle) return;
+    if (isPlaying) {
+      handle.pause();
+    } else {
+      handle.play();
+    }
+    setIsPlaying((prev) => !prev);
+  }, [activeItem, isPlaying]);
+
+  const handleSeekBy = useCallback(
+    (seconds: number) => {
+      const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
+      if (!handle) return;
+      handle.seekBy(seconds);
+    },
+    [activeItem]
+  );
+
+  useEffect(() => {
     if (isEarnedReward && adDataRef.current) {
       const { episodeId } = adDataRef.current;
       setUnlockedEpisodes((prev) => ({ ...prev, [episodeId]: true }));
@@ -173,6 +199,9 @@ export default function FeedScreen() {
       return (
         <View style={styles.feedItem}>
           <VideoPlayer
+            ref={(r) => {
+              videoRefs.current[item.episode.id] = r;
+            }}
             uri={ep.videoUrl || ''}
             isActive={isActive}
           />
@@ -180,6 +209,35 @@ export default function FeedScreen() {
           <View style={styles.overlay}>
             <View style={[styles.topBar, { paddingTop: insets.top + 12 }]}>
               <Text style={styles.brandText}>AI Series</Text>
+            </View>
+
+            <View style={styles.controlsLayer}>
+              {!isPlaying && (
+                <Pressable style={styles.centerPlayButton} onPress={handleTogglePlay}>
+                  <Text style={styles.centerPlayIcon}>▶</Text>
+                </Pressable>
+              )}
+            </View>
+
+            <View style={styles.controlsRow}>
+              <Pressable
+                style={styles.controlButton}
+                onPress={() => handleSeekBy(-10)}
+              >
+                <Text style={styles.controlIcon}>⏪</Text>
+                <Text style={styles.controlLabel}>10s</Text>
+              </Pressable>
+              <Pressable style={styles.controlButton} onPress={handleTogglePlay}>
+                <Text style={styles.controlIcon}>{isPlaying ? '⏸' : '▶'}</Text>
+                <Text style={styles.controlLabel}>{isPlaying ? 'Pause' : 'Play'}</Text>
+              </Pressable>
+              <Pressable
+                style={styles.controlButton}
+                onPress={() => handleSeekBy(30)}
+              >
+                <Text style={styles.controlIcon}>⏩</Text>
+                <Text style={styles.controlLabel}>30s</Text>
+              </Pressable>
             </View>
 
             <View style={styles.bottomSection}>
@@ -259,6 +317,9 @@ export default function FeedScreen() {
       handleLike,
       handleShare,
       handleWatchAd,
+      handleTogglePlay,
+      handleSeekBy,
+      isPlaying,
       isLoaded,
       seriesMap,
     ]
@@ -378,6 +439,45 @@ const styles = StyleSheet.create({
   topBar: {
     paddingHorizontal: 16,
     paddingBottom: 8,
+  },
+  controlsLayer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  centerPlayButton: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.35)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  centerPlayIcon: {
+    color: '#fff',
+    fontSize: 34,
+    marginLeft: 4,
+  },
+  controlsRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 32,
+    paddingBottom: 12,
+  },
+  controlButton: {
+    alignItems: 'center',
+    gap: 2,
+  },
+  controlIcon: {
+    color: '#fff',
+    fontSize: 24,
+  },
+  controlLabel: {
+    color: '#fff',
+    fontSize: 11,
   },
   brandText: {
     color: '#E50914',

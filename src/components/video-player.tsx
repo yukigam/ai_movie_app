@@ -1,10 +1,16 @@
 import { useEvent, useEventListener } from 'expo';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1500;
+
+export type VideoPlayerHandle = {
+  play: () => void;
+  pause: () => void;
+  seekBy: (seconds: number) => void;
+};
 
 interface VideoPlayerProps {
   uri: string;
@@ -22,14 +28,25 @@ function normalizeUrl(uri: string): string {
   return trimmed;
 }
 
-export function VideoPlayer({ uri, isActive }: VideoPlayerProps) {
-  const source = normalizeUrl(uri);
-  const hasUri = source.length > 0;
+export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
+  function VideoPlayer({ uri, isActive }, ref) {
+    const source = normalizeUrl(uri);
+    const hasUri = source.length > 0;
 
-  const player = useVideoPlayer(hasUri ? { uri: source } : null, (p) => {
-    p.loop = true;
-    p.muted = false;
-  });
+    const player = useVideoPlayer(hasUri ? { uri: source } : null, (p) => {
+      p.loop = true;
+      p.muted = false;
+    });
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        play: () => player.play(),
+        pause: () => player.pause(),
+        seekBy: (seconds: number) => player.seekBy(seconds),
+      }),
+      [player]
+    );
 
   const { status } = useEvent(player, 'statusChange', { status: player.status });
   const [retryCount, setRetryCount] = useState(0);
@@ -113,6 +130,7 @@ export function VideoPlayer({ uri, isActive }: VideoPlayerProps) {
     </View>
   );
 }
+);
 
 const styles = StyleSheet.create({
   container: {
