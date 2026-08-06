@@ -33,6 +33,7 @@ import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -132,8 +133,20 @@ RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "tiktok-downloader-download-tiktok-vi
 # ── Playwright (optional) ──────────────────────────────────────────────────
 
 def _playwright_available() -> bool:
-    """Return True if a Playwright storage state file exists (user has logged in)."""
-    return os.path.isfile(PLAYWRIGHT_STORAGE)
+    """Return True if series extraction can be attempted.
+
+    A saved login state (playwright_storage.json) is preferred but NOT
+    required: on Render the file does not exist (fresh container, no
+    volumes), so the bot must still try extraction — the headless context
+    simply starts without cookies and the login-wall is dismissed in-page.
+    """
+    if os.path.isfile(PLAYWRIGHT_STORAGE):
+        return True
+    try:
+        import playwright  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
     """Extract episode URLs via Playwright. Returns [] on failure.
@@ -151,6 +164,8 @@ def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
     if not _playwright_available():
         log.info("Playwright storage not found — skipping series extraction")
         return []
+    if not os.path.isfile(PLAYWRIGHT_STORAGE):
+        log.info("No saved login state — extraction runs without TikTok session (fresh headless context)")
     try:
         from tiktok_playwright import extract_episodes_sync
         import concurrent.futures
@@ -1172,6 +1187,21 @@ class Store:
         except Exception as e:
             log.error("Marking EP %s of %s as pending failed: %s", num, sid, e)
 
+    def bulk_upsert_pending(self, sid: str, rows: list[dict]) -> None:
+        """Write many PENDING episode rows in ONE bulk upsert call, so the
+        whole series appears in the DB instantly (the upload loop then fills
+        in the real video_url row by row)."""
+        if not rows:
+            return
+        try:
+            self.db.table("episodes").upsert(rows, on_conflict="id").execute()
+            cnt = self.db.table("episodes").select("id", count="exact").eq("series_id", sid).execute().count or 0
+            self.db.table("series").update({"episode_count": cnt}).eq("id", sid).execute()
+        except Exception as e:
+            log.error("Bulk pending upsert for %s failed (%d rows): %s", sid, len(rows), e)
+            for row in rows:
+                self.db.table("episodes").upsert(row, on_conflict="id").execute()
+
     def upload_video(self, sid: str, num: int, src_url: str, preloaded_bytes: bytes | None = None) -> str:
         if not self._storage_ready:
             return src_url
@@ -1677,6 +1707,8 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
     failed: list[tuple] = []
     inserted_eps: list[tuple] = []
     touched_titles: dict[str, str] = {}
+    # Episodes bulk-registered as pending by THIS import (before upload).
+    pre_registered: set[tuple[str, int]] = set()
 
     total_groups = len(groups)
     total_episodes = sum(len(v) for v in groups.values())
@@ -1742,20 +1774,53 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
             next_num += 1
         ordered = known + unknown
 
+        # ── Bulk pre-registration (ONE upsert call per series): every
+        #    episode that is not already healthy is written into the DB as
+        #    PENDING right away, so the series (and its full episode list)
+        #    appears in the app instantly.  The upload loop below then fills
+        #    in the real video_url row by row.
+        bulk_rows: list[dict] = []
+        for v in ordered:
+            ep = v["_ep"]
+            if store.episode_exists(skey, ep) and not store.is_episode_pending(skey, ep) and not store.is_episode_video_broken(skey, ep):
+                continue
+            source = v.get("_page_url") or v.get("video_url") or ""
+            row = {
+                "id": f"ep-{skey}-{ep}",
+                "series_id": skey,
+                "episode_number": ep,
+                "title": v.get("title") or f"EP.{ep}",
+                "description": source if not store.has_status else (v.get("description") or ""),
+                "video_url": "",
+                "thumbnail_url": "",
+                "duration": 0,
+                "is_free": ep <= DEFAULT_FREE_FIRST,
+            }
+            if store.has_status:
+                row["status"] = "pending"
+                row["source_url"] = source
+            bulk_rows.append(row)
+            pre_registered.add((skey, ep))
+        if bulk_rows:
+            store.bulk_upsert_pending(skey, bulk_rows)
+
         for v in ordered:
             ep = v["_ep"]
             processed += 1
             if store.episode_exists(skey, ep):
+                if (skey, ep) in pre_registered:
+                    pass  # bulk-registered by this import — just upload it
                 # Skip ONLY healthy existing episodes.  Pending (incomplete/
                 # retrying) and broken (0-byte/expired) episodes are never
                 # treated as duplicates — they are re-downloaded & completed.
-                if not force and not store.is_episode_pending(skey, ep) and not store.is_episode_video_broken(skey, ep):
+                elif not force and not store.is_episode_pending(skey, ep) and not store.is_episode_video_broken(skey, ep):
                     skipped += 1
                     continue
-                overwritten += 1
+                else:
+                    overwritten += 1
                 log.info(
                     "EP %s of %s exists but is %s — re-importing (overwrite)",
-                    ep, stitle, "forced" if force else "pending/broken",
+                    ep, stitle, "forced" if force else ("pending/broken" if (skey, ep) not in pre_registered else "just pre-registered"),
                 )
 
             # Upload video & thumbnail to Supabase Storage (replaces tikcdn.io URLs)
@@ -2013,7 +2078,20 @@ def main() -> None:
 
     app.add_error_handler(_error_handler)
     log.info("🤖 TikTok → Supabase bot running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # ── Polling loop with single-instance protection ──────────────────────
+    # Render's rolling deploys briefly run TWO containers with the same
+    # bot token → Telegram throws `Conflict: terminated by other getUpdates
+    # request`.  Instead of crashing, the bot logs it and retries until the
+    # old instance has released the webhook/polling lock.
+    # `drop_pending_updates` skips any stale updates queued while down.
+    while True:
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break  # graceful shutdown (KeyboardInterrupt / /stop)
+        except Conflict as e:
+            log.warning("Telegram Conflict (another instance polling) — retrying in 60s: %s", e)
+            time.sleep(60)
 
 
 if __name__ == "__main__":
