@@ -12,6 +12,7 @@ import {
   Modal,
   ActivityIndicator,
 } from 'react-native';
+import Slider from '@react-native-community/slider';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Episode, Series } from '@/types/series';
 import { VideoPlayer, VideoPlayerHandle } from '@/components/video-player';
@@ -36,6 +37,10 @@ export default function FeedScreen() {
   const [activeIndex, setActiveIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(true);
   const [showControls, setShowControls] = useState(false);
+  const [position, setPosition] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isSeeking, setIsSeeking] = useState(false);
+  const [seekPosition, setSeekPosition] = useState(0);
   const [likedEpisodes, setLikedEpisodes] = useState<Record<string, boolean>>({});
   const [unlockedEpisodes, setUnlockedEpisodes] = useState<Record<string, boolean>>({});
   const [modalVisible, setModalVisible] = useState(false);
@@ -162,15 +167,27 @@ export default function FeedScreen() {
     resetControlsTimer();
   }, [activeItem, isPlaying, resetControlsTimer]);
 
-  const handleSeekBy = useCallback(
+  const handleSeekTo = useCallback(
     (seconds: number) => {
       const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
       if (!handle) return;
-      handle.seekBy(seconds);
+      handle.seekTo(seconds);
+      setPosition(seconds);
       resetControlsTimer();
     },
     [activeItem, resetControlsTimer]
   );
+
+  useEffect(() => {
+    if (!showControls) return;
+    const handle = activeItem?.episode.id ? videoRefs.current[activeItem.episode.id] : null;
+    if (!handle) return;
+    const id = setInterval(() => {
+      setPosition(handle.getCurrentTime());
+      setDuration(handle.getDuration());
+    }, 250);
+    return () => clearInterval(id);
+  }, [showControls, activeItem?.episode.id]);
 
   useEffect(() => {
     if (isEarnedReward && adDataRef.current) {
@@ -201,6 +218,13 @@ export default function FeedScreen() {
     if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
     if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
     return String(count);
+  };
+
+  const formatTime = (seconds: number): string => {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const s = Math.floor(seconds);
+    const m = Math.floor(s / 60);
+    return `${m}:${String(s % 60).padStart(2, '0')}`;
   };
 
   useEffect(() => {
@@ -238,34 +262,33 @@ export default function FeedScreen() {
             </View>
           )}
 
-          {!isPlaying && (
+          {showControls && (
             <Pressable style={styles.centerPlayButton} onPress={handleTogglePlay}>
-              <Text style={styles.centerPlayIcon}>▶</Text>
+              <Text style={styles.centerPlayIcon}>{isPlaying ? '⏸' : '▶'}</Text>
             </Pressable>
           )}
 
           {showControls && (
             <View style={styles.controlsBottom}>
-              <View style={styles.controlsRow}>
-              <Pressable
-                style={styles.controlButton}
-                onPress={() => handleSeekBy(-10)}
-              >
-                <Text style={styles.controlIcon}>⏪</Text>
-                <Text style={styles.controlLabel}>10s</Text>
-              </Pressable>
-              <Pressable style={styles.controlButton} onPress={handleTogglePlay}>
-                <Text style={styles.controlIcon}>{isPlaying ? '⏸' : '▶'}</Text>
-                <Text style={styles.controlLabel}>{isPlaying ? 'Pause' : 'Play'}</Text>
-              </Pressable>
-              <Pressable
-                style={styles.controlButton}
-                onPress={() => handleSeekBy(30)}
-              >
-                <Text style={styles.controlIcon}>⏩</Text>
-                <Text style={styles.controlLabel}>30s</Text>
-              </Pressable>
-            </View>
+              <View style={styles.seekRow}>
+                <Text style={styles.timeText}>{formatTime(isSeeking ? seekPosition : position)}</Text>
+                <Slider
+                  style={styles.seekBar}
+                  minimumValue={0}
+                  maximumValue={Math.max(duration, 1)}
+                  value={isSeeking ? seekPosition : position}
+                  onSlidingStart={() => setIsSeeking(true)}
+                  onValueChange={setSeekPosition}
+                  onSlidingComplete={(v) => {
+                    setIsSeeking(false);
+                    handleSeekTo(v);
+                  }}
+                  minimumTrackTintColor="#FF0000"
+                  maximumTrackTintColor="rgba(255,255,255,0.35)"
+                  thumbTintColor="#FF0000"
+                />
+                <Text style={styles.timeText}>{formatTime(duration)}</Text>
+              </View>
 
             <View style={styles.bottomSection}>
               <View style={styles.infoArea}>
@@ -349,11 +372,15 @@ export default function FeedScreen() {
       handleShare,
       handleWatchAd,
       handleTogglePlay,
-      handleSeekBy,
+      handleSeekTo,
       handleToggleControls,
       isPlaying,
       isLoaded,
       showControls,
+      position,
+      duration,
+      isSeeking,
+      seekPosition,
       seriesMap,
     ]
   );
@@ -478,6 +505,23 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
   },
+  seekRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 4,
+    gap: 8,
+  },
+  seekBar: {
+    flex: 1,
+    height: 32,
+    marginVertical: -10,
+  },
+  timeText: {
+    color: '#fff',
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+  },
   actionRail: {
     position: 'absolute',
     right: 12,
@@ -503,25 +547,6 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 34,
     marginLeft: 4,
-  },
-  controlsRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    gap: 32,
-    paddingBottom: 12,
-  },
-  controlButton: {
-    alignItems: 'center',
-    gap: 2,
-  },
-  controlIcon: {
-    color: '#fff',
-    fontSize: 24,
-  },
-  controlLabel: {
-    color: '#fff',
-    fontSize: 11,
   },
   brandText: {
     color: '#E50914',

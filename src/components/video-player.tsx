@@ -10,6 +10,9 @@ export type VideoPlayerHandle = {
   play: () => void;
   pause: () => void;
   seekBy: (seconds: number) => void;
+  seekTo: (seconds: number) => void;
+  getCurrentTime: () => number;
+  getDuration: () => number;
 };
 
 interface VideoPlayerProps {
@@ -36,6 +39,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     const player = useVideoPlayer(hasUri ? { uri: source } : null, (p) => {
       p.loop = true;
       p.muted = false;
+      p.timeUpdateEventInterval = 0.25;
     });
 
     useImperativeHandle(
@@ -44,6 +48,11 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         play: () => player.play(),
         pause: () => player.pause(),
         seekBy: (seconds: number) => player.seekBy(seconds),
+        seekTo: (seconds: number) => {
+          player.currentTime = seconds;
+        },
+        getCurrentTime: () => player.currentTime,
+        getDuration: () => player.duration,
       }),
       [player]
     );

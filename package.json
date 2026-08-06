@@ -3,6 +3,7 @@
   "main": "expo-router/entry",
   "version": "1.0.0",
   "dependencies": {
+    "@react-native-community/slider": "5.2.0",
     "@supabase/supabase-js": "^2.39.0",
     "expo": "~57.0.0",
     "expo-asset": "~57.0.7",
