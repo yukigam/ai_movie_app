@@ -184,9 +184,22 @@ async def create_playwright_context(p, headless: bool = True):
     try:
         browser = await p.chromium.launch(
             headless=headless,
-            args=[
-                "--no-sandbox",
-            ],
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-features=site-per-process,Translate",
+            "--mute-audio",
+            "--no-first-run",
+        ],
         )
     except Exception as e:
         if "Executable doesn't exist" not in str(e):
@@ -205,9 +218,22 @@ async def create_playwright_context(p, headless: bool = True):
         )
         browser = await p.chromium.launch(
             headless=headless,
-            args=[
-                "--no-sandbox",
-            ],
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-features=site-per-process,Translate",
+            "--mute-audio",
+            "--no-first-run",
+        ],
         )
 
     # Use a current Chrome UA (2026)
@@ -2783,25 +2809,26 @@ async def _do_login():
         print("After logging in successfully, close the browser window.")
         print("=" * 60)
 
-        await page.goto("https://www.tiktok.com/login", timeout=30000, wait_until="domcontentloaded")
-        print("Browser opened. Complete login, then close the browser.")
+        try:
+            await page.goto("https://www.tiktok.com/login", timeout=30000, wait_until="domcontentloaded")
+            print("Browser opened. Complete login, then close the browser.")
 
-        while True:
-            try:
-                if not page or page.is_closed():
-                    break
-                await asyncio.sleep(1)
-                current = page.url
-                if "login" not in current and "tiktok.com" in current:
-                    await asyncio.sleep(3)
-                    if "login" not in page.url:
-                        print("Login detected! Saving storage state...")
+            while True:
+                try:
+                    if not page or page.is_closed():
                         break
-            except Exception:
-                break
-
-        await save_storage(context)
-        await browser.close()
+                    await asyncio.sleep(1)
+                    current = page.url
+                    if "login" not in current and "tiktok.com" in current:
+                        await asyncio.sleep(3)
+                        if "login" not in page.url:
+                            print("Login detected! Saving storage state...")
+                            break
+                except Exception:
+                    break
+        finally:
+            await save_storage(context)
+            await browser.close()
 
     if _storage_exists():
         print(f"[OK] Storage state saved to {STORAGE_STATE}")
