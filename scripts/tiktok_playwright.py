@@ -1697,6 +1697,27 @@ async def _recover_page(page, browser, url: str, on_response=None):
     return new_page
 
 
+async def _expected_total_from_page(page) -> int | None:
+    """Expected series total = max end across sidebar tab labels ("1-24", "25-48"…).
+
+    Returns None when the page shows no paginated tabs (single-grid series or
+    a non-series page).
+    """
+    try:
+        ends = await page.evaluate("""() => {
+            const ends = [];
+            for (const el of document.querySelectorAll('button, a, [role="tab"], [role="button"], [role="link"]')) {
+                const t = (el.textContent || '').trim();
+                const m = t.match(/^(\\d+)\\s*-\\s*(\\d+)$/);
+                if (m) ends.push(parseInt(m[2], 10));
+            }
+            return ends;
+        }""")
+        return max(ends) if ends else None
+    except Exception:
+        return None
+
+
 async def extract_episodes(
     url: str,
     *,
@@ -1886,23 +1907,32 @@ async def extract_episodes(
             log.info("Strategy A: scanning rehydration data for series info...")
             rehydration_episodes = await _extract_series_from_rehydration(page, username)
             if rehydration_episodes and len(rehydration_episodes) > 1:
-                log.info("Strategy A SUCCESS: found %d episodes via rehydration data", len(rehydration_episodes))
-                # Merge with current video
+                expected = await _expected_total_from_page(page)
                 seen_ids = {e["id"] for e in episodes}
                 for ep in rehydration_episodes:
                     if ep["id"] not in seen_ids:
                         seen_ids.add(ep["id"])
                         episodes.append(ep)
-                if len(episodes) > 1:
-                    series_title = await _get_series_title(page)
-                    episodes.sort(key=lambda x: x["episode"])
-                    if series_title:
-                        episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
-                    log.info("Returning %d episodes from rehydration data", len(episodes))
-                    if save_on_success:
-                        await save_storage(context)
-                    await browser.close()
-                    return episodes
+                # Fast path ONLY when the rehydration list covers the whole
+                # series.  A partial list (e.g. 24 of 69 — TikTok embeds only
+                # part of the playlist) must NEVER stop extraction early:
+                # seed it and let the sidebar strategy fill the rest.
+                if expected is None or len(episodes) >= expected - 2:
+                    log.info("Strategy A SUCCESS: found %d episodes via rehydration data", len(episodes))
+                    if len(episodes) > 1:
+                        series_title = await _get_series_title(page)
+                        episodes.sort(key=lambda x: x["episode"])
+                        if series_title:
+                            episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
+                        log.info("Returning %d episodes from rehydration data", len(episodes))
+                        if save_on_success:
+                            await save_storage(context)
+                        await browser.close()
+                        return episodes
+                else:
+                    log.warning("Rehydration list is PARTIAL (%d of ~%d) — seeding and "
+                                "continuing to the sidebar strategy for the rest",
+                                len(episodes), expected)
 
             # Random delay before trying next strategy
             await _random_sleep(2.0, 5.0)
@@ -1930,24 +1960,32 @@ async def extract_episodes(
                 # Extract video links from the current (series) page
                 series_eps = await _extract_video_ids_from_page(page, username)
                 if series_eps and len(series_eps) > 1:
-                    log.info("Strategy B SUCCESS: found %d episodes from series page", len(series_eps))
+                    expected = await _expected_total_from_page(page)
                     seen_ids = {e["id"] for e in episodes}
                     for ep in series_eps:
                         if ep["id"] not in seen_ids:
                             seen_ids.add(ep["id"])
                             episodes.append(ep)
-                    if len(episodes) > 1:
-                        series_title = await _get_series_title(page)
-                        episodes.sort(key=lambda x: x["episode"])
-                        # Re-number episodes sequentially
-                        for i, ep in enumerate(episodes, 1):
-                            ep["episode"] = i
-                        if series_title:
-                            episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
-                        if save_on_success:
-                            await save_storage(context)
-                        await browser.close()
-                        return episodes
+                    # Same completeness rule as Strategy A: a partial grid read
+                    # must not end extraction — continue to the sidebar clicks.
+                    if expected is None or len(episodes) >= expected - 2:
+                        log.info("Strategy B SUCCESS: found %d episodes from series page", len(episodes))
+                        if len(episodes) > 1:
+                            series_title = await _get_series_title(page)
+                            episodes.sort(key=lambda x: x["episode"])
+                            # Re-number episodes sequentially
+                            for i, ep in enumerate(episodes, 1):
+                                ep["episode"] = i
+                            if series_title:
+                                episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
+                            if save_on_success:
+                                await save_storage(context)
+                            await browser.close()
+                            return episodes
+                    else:
+                        log.warning("Series page list is PARTIAL (%d of ~%d) — seeding and "
+                                    "continuing to the sidebar strategy for the rest",
+                                    len(episodes), expected)
 
             # ── Debug mode: dump page structure ─────────────────────────────
             if debug_mode:
