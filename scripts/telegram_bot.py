@@ -24,6 +24,7 @@ import re
 import sys
 import time
 
+import gc
 import tempfile
 import threading
 
@@ -1257,6 +1258,52 @@ class Store:
         self.db.table("series").update({"episode_count": cnt}).eq("id", sid).execute()
 
 
+# ── Sequential job queue ─────────────────────────────────────────────────────
+# Every import request (series link, /series, /single, /force, profile) is
+# pushed onto ONE asyncio.Queue and processed by a single worker task, one
+# job at a time.  A 69-episode series import must finish BEFORE the next
+# link is even started — this guarantees:
+#   • no two imports fight over the Playwright browser / TikTok rate limits
+#   • at most ONE browser is ever alive → RAM usage stays bounded
+#   • the user sees a deterministic queue position instead of chaos
+JOB_QUEUE: asyncio.Queue = asyncio.Queue()
+_job_worker_task: asyncio.Task | None = None
+
+
+async def _job_worker() -> None:
+    """Lone consumer of JOB_QUEUE — runs jobs strictly sequentially."""
+    while True:
+        job = await JOB_QUEUE.get()
+        try:
+            await job()
+        except Exception:
+            log.exception("Job worker: job crashed")
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def _ensure_job_worker() -> None:
+    """Start the worker task on the running event loop (first use only)."""
+    global _job_worker_task
+    if _job_worker_task is None or _job_worker_task.done():
+        _job_worker_task = asyncio.get_running_loop().create_task(_job_worker())
+
+
+async def _enqueue_job(msg, label: str, job) -> None:
+    """Push *job* onto the sequential queue and reply with its position."""
+    _ensure_job_worker()
+    pos = JOB_QUEUE.qsize() + 1
+    if pos == 1:
+        reply = f"⏳ *{label}* эхэлж байна…"
+    else:
+        reply = (
+            f"⏳ *{label}* дараалалд орлоо (байр: #{pos}).\n"
+            "Өмнөх импорт дууссаны дараа автоматаар эхэлнэ."
+        )
+    await msg.reply_text(reply, parse_mode="Markdown")
+    await JOB_QUEUE.put(job)
+
+
 # ── Bot handlers ────────────────────────────────────────────────────────────
 
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1325,8 +1372,11 @@ async def cmd_series(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await upd.message.reply_text("Please provide a full TikTok video URL.")
             return
 
-    status = await upd.message.reply_text("🔍 Analysing video for series episodes…")
-    await _playlist(url, status)
+    async def job() -> None:
+        status = await upd.message.reply_text("🔍 Analysing video for series episodes…")
+        await _playlist(url, status)
+
+    await _enqueue_job(upd.message, "Цуврал импорт", job)
 
 
 async def _handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool = False) -> None:
@@ -1427,22 +1477,29 @@ async def cmd_single(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "and the video is added/updated in DB + storage directly.",
         )
         return
-    status = await upd.message.reply_text("🎬 Single video import (no series scan)…")
-    m = re.search(r"https?://\S+", upd.message.text)
-    url = m.group(0)
-    # Custom title before/after the URL (same as plain messages)
-    before = upd.message.text[:m.start()].strip()
-    after = upd.message.text[m.end():].strip()
-    custom = (before or after).strip()
-    if custom and not re.match(r"^[@#]\S*$", custom) and not custom.startswith("/"):
-        ctx.user_data["custom_title"] = clean_caption(custom) or custom
-    else:
-        ctx.user_data.pop("custom_title", None)
-    await _single(url, status, ctx)
+
+    async def job() -> None:
+        status = await upd.message.reply_text("🎬 Single video import (no series scan)…")
+        m = re.search(r"https?://\S+", upd.message.text)
+        url = m.group(0)
+        # Custom title before/after the URL (same as plain messages)
+        before = upd.message.text[:m.start()].strip()
+        after = upd.message.text[m.end():].strip()
+        custom = (before or after).strip()
+        if custom and not re.match(r"^[@#]\S*$", custom) and not custom.startswith("/"):
+            ctx.user_data["custom_title"] = clean_caption(custom) or custom
+        else:
+            ctx.user_data.pop("custom_title", None)
+        await _single(url, status, ctx)
+
+    await _enqueue_job(upd.message, "Ганц видео импорт", job)
 
 
 async def handle_msg(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_text(upd, ctx, force=False)
+    async def job() -> None:
+        await _handle_text(upd, ctx, force=False)
+
+    await _enqueue_job(upd.message, "Импорт", job)
 
 
 async def cmd_force(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1455,7 +1512,11 @@ async def cmd_force(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "even when the current video looks healthy.",
         )
         return
-    await _handle_text(upd, ctx, force=True)
+
+    async def job() -> None:
+        await _handle_text(upd, ctx, force=True)
+
+    await _enqueue_job(upd.message, "Давхар импорт (force)", job)
 
 
 BATCH_LIMIT = 50
@@ -1586,6 +1647,13 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
             except asyncio.TimeoutError:
                 log.warning("EP %s: fetch attempt %d/%d timed out (%.0fs) — re-syncing",
                             ep['episode'], attempt, IMMEDIATE_RETRIES, timeout)
+            except Exception as e:
+                # Skip-and-log: a single bad episode must never stop the
+                # whole series import — mark it failed and move on.
+                log.error("EP %s: fetch attempt %d/%d crashed: %s — skipping to next episode",
+                          ep['episode'], attempt, IMMEDIATE_RETRIES, clean_error(e))
+                data = None
+                break
             if attempt < IMMEDIATE_RETRIES:
                 await asyncio.sleep(2)
         if data and data.get("video_url"):
@@ -1633,6 +1701,12 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
                         timeout=timeout,
                     )
                 except asyncio.TimeoutError:
+                    still_failed.append(ep)
+                    continue
+                except Exception as e:
+                    # Skip-and-log: keep the retry pass alive.
+                    log.error("EP %s: retry fetch crashed: %s — keeping it for the next round",
+                              ep["episode"], clean_error(e))
                     still_failed.append(ep)
                     continue
                 if data and data.get("video_url"):
@@ -1709,6 +1783,21 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
 
 
 # ── Insertion ───────────────────────────────────────────────────────────────
+
+def _log_memory(tag: str) -> None:
+    """Log the process RSS so RAM growth is visible in Render logs.
+
+    Reads /proc/self/status (Linux — Render); a silent no-op elsewhere.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    log.info("[mem:%s] RSS=%.1f MB", tag, kb / 1024)
+                    return
+    except Exception:
+        pass
 
 async def _insert(msg, videos: list[dict], force: bool = False) -> None:
     store = Store()
@@ -1852,11 +1941,24 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
                 f"⬆️ Uploading video to storage…",
                 parse_mode="Markdown",
             )
-            preloaded = v.get("_video_bytes") or None
-            video_url = await asyncio.to_thread(store.upload_video, skey, ep, v["video_url"], preloaded)
-            thumb_url = v["thumbnail"]
-            if thumb_url:
-                thumb_url = await asyncio.to_thread(store.upload_thumbnail, skey, ep, thumb_url)
+            try:
+                preloaded = v.get("_video_bytes") or None
+                video_url = await asyncio.to_thread(store.upload_video, skey, ep, v["video_url"], preloaded)
+                thumb_url = v["thumbnail"]
+                if thumb_url:
+                    thumb_url = await asyncio.to_thread(store.upload_thumbnail, skey, ep, thumb_url)
+            except Exception as e:
+                # Skip-and-log: an upload crash must never abort the series —
+                # mark the episode failed and continue with the next one.
+                log.error("Upload crashed for EP %s of %s: %s — queued for retry",
+                          ep, stitle, clean_error(e))
+                v.pop("_video_bytes", None)
+                failed.append((skey, ep, stitle, v))
+                continue
+
+            # Free the downloaded bytes NOW — keeping every episode's video in
+            # RAM for the whole import would pin 10–50 MB × N episodes (OOM).
+            v.pop("_video_bytes", None)
 
             if not video_url:
                 # Upload failed (download error or content < MIN_VIDEO_SIZE).
@@ -1870,6 +1972,11 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
             store.upsert_episode(skey, ep, v, ep <= DEFAULT_FREE_FIRST)
             inserted += 1
             inserted_eps.append((skey, ep, stitle, v))
+
+            # Per-episode memory hygiene: return video bytes to the OS and
+            # log RSS so RAM growth stays visible in the Render logs.
+            gc.collect()
+            _log_memory(f"after EP {ep} of {stitle}")
 
     # ── Strict retry pass: re-download + re-upload every failed episode,
     #    up to MAX_UPLOAD_ATTEMPTS rounds.  Each attempt runs the full
@@ -1887,15 +1994,22 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
             )
             still: list[tuple] = []
             for fkey, fep, ftitle, fv in failed:
-                data = await asyncio.to_thread(
-                    _fetch_video, fv.get("_page_url") or fv["video_url"], fv.get("title")
-                )
-                if not data:
+                try:
+                    data = await asyncio.to_thread(
+                        _fetch_video, fv.get("_page_url") or fv["video_url"], fv.get("title")
+                    )
+                    if not data:
+                        still.append((fkey, fep, ftitle, fv))
+                        continue
+                    rvideo = await asyncio.to_thread(
+                        store.upload_video, fkey, fep, data["video_url"], data.get("_video_bytes") or None
+                    )
+                    data.pop("_video_bytes", None)
+                except Exception as e:
+                    log.error("Retry crashed for EP %s of %s: %s — keeping it for the next round",
+                              fep, ftitle, clean_error(e))
                     still.append((fkey, fep, ftitle, fv))
                     continue
-                rvideo = await asyncio.to_thread(
-                    store.upload_video, fkey, fep, data["video_url"], data.get("_video_bytes") or None
-                )
                 if rvideo:
                     fv["video_url"] = rvideo
                     store.upsert_episode(fkey, fep, fv, fep <= DEFAULT_FREE_FIRST)
@@ -1924,15 +2038,22 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
                     break
                 still_broken: list[tuple] = []
                 for bkey, bep, btitle, bv in broken_eps:
-                    data = await asyncio.to_thread(
-                        _fetch_video, bv.get("_page_url") or bv["video_url"], bv.get("title")
-                    )
-                    if not data:
+                    try:
+                        data = await asyncio.to_thread(
+                            _fetch_video, bv.get("_page_url") or bv["video_url"], bv.get("title")
+                        )
+                        if not data:
+                            still_broken.append((bkey, bep, btitle, bv))
+                            continue
+                        rvideo = await asyncio.to_thread(
+                            store.upload_video, bkey, bep, data["video_url"], data.get("_video_bytes") or None
+                        )
+                        data.pop("_video_bytes", None)
+                    except Exception as e:
+                        log.error("Auto-clean crashed for EP %s of %s: %s — keeping it for the next round",
+                                  bep, btitle, clean_error(e))
                         still_broken.append((bkey, bep, btitle, bv))
                         continue
-                    rvideo = await asyncio.to_thread(
-                        store.upload_video, bkey, bep, data["video_url"], data.get("_video_bytes") or None
-                    )
                     if rvideo:
                         bv["video_url"] = rvideo
                         store.upsert_episode(bkey, bep, bv, bep <= DEFAULT_FREE_FIRST)
@@ -1994,13 +2115,20 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
                     break
                 still_pending: list[tuple] = []
                 for skey, ep, stitle, src, title in pending_sources:
-                    data = await asyncio.to_thread(_fetch_video, src, title)
-                    if not data or not data.get("video_url"):
+                    try:
+                        data = await asyncio.to_thread(_fetch_video, src, title)
+                        if not data or not data.get("video_url"):
+                            still_pending.append((skey, ep, stitle, src, title))
+                            continue
+                        rvideo = await asyncio.to_thread(
+                            store.upload_video, skey, ep, data["video_url"], data.get("_video_bytes") or None
+                        )
+                        data.pop("_video_bytes", None)
+                    except Exception as e:
+                        log.error("Cleanup crashed for EP %s of %s: %s — keeping it for the next round",
+                                  ep, stitle, clean_error(e))
                         still_pending.append((skey, ep, stitle, src, title))
                         continue
-                    rvideo = await asyncio.to_thread(
-                        store.upload_video, skey, ep, data["video_url"], data.get("_video_bytes") or None
-                    )
                     if rvideo:
                         data["_page_url"] = src
                         data["title"] = title
