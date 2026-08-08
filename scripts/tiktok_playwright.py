@@ -29,6 +29,7 @@ import os
 import random
 import re
 import socket
+import subprocess
 import sys
 import time as time_module
 from pathlib import Path
@@ -180,12 +181,34 @@ async def create_playwright_context(p, headless: bool = True):
     
     Returns ``(browser, context)``.
     """
-    browser = await p.chromium.launch(
-        headless=headless,
-        args=[
-            "--no-sandbox",
-        ],
-    )
+    try:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+            ],
+        )
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+        log.error("Chromium executable missing (%s) — installing it now...", str(e)[:160])
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        log.info(
+            "playwright install chromium → rc=%s tail=%s",
+            proc.returncode,
+            (proc.stdout or "")[-300:].replace("\n", " "),
+        )
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+            ],
+        )
 
     # Use a current Chrome UA (2026)
     context = await browser.new_context(

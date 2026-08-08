@@ -790,45 +790,63 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
 
 
 def _ensure_cookies():
-    """Convert playwright_storage.json → cookies.txt if the latter is missing or stale."""
+    """Convert playwright_storage.json → cookies.txt (Netscape format).
+
+    Never crashes and never clobbers an existing cookies.txt:
+    - no storage file / empty file (the container entrypoint pre-creates an
+      empty one) / unparseable JSON / zero cookies → skipped silently
+    - an existing cookies.txt (e.g. the read-only Render secret file) is
+      left untouched unless the storage session is NEWER than it.
+    """
     pw_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "playwright_storage.json")
-    if not os.path.isfile(pw_file):
-        return
-    if os.path.isfile(COOKIES_PATH):
-        pw_mtime = os.path.getmtime(pw_file)
-        ck_mtime = os.path.getmtime(COOKIES_PATH)
-        if pw_mtime <= ck_mtime:
-            return  # cookies.txt is up-to-date
     try:
-        import json
-        with open(pw_file) as f:
+        if not os.path.isfile(pw_file) or os.path.getsize(pw_file) < 20:
+            log.debug("No usable playwright_storage.json yet — skipping cookies.txt generation")
+            return
+        with open(pw_file, encoding="utf-8") as f:
             data = json.load(f)
-        cookies = data.get("cookies", [])
-        lines = [
-            "# Netscape HTTP Cookie File",
-            "# Generated from playwright_storage.json by telegram_bot.py",
-        ]
-        for c in cookies:
-            domain = c.get("domain", "")
-            if "tiktok" not in domain and "byte" not in domain:
-                continue
-            if not domain.startswith("."):
-                domain = "." + domain
-            name = c.get("name", "")
-            value = c.get("value", "")
-            path = c.get("path", "/")
-            secure = c.get("secure", False)
-            expires = c.get("expires", 0)
-            if expires is None or expires <= 0:
-                expires = 1893456000  # Jan 1 2030
-            domain_flag = "TRUE"
-            secure_flag = "TRUE" if secure else "FALSE"
-            lines.append(f"{domain}\t{domain_flag}\t{path}\t{secure_flag}\t{expires}\t{name}\t{value}")
+        cookies = data.get("cookies", []) if isinstance(data, dict) else []
+    except Exception as e:
+        log.debug("playwright_storage.json not parseable (%s) — skipping cookies.txt generation", e)
+        return
+    if not cookies:
+        log.debug("playwright_storage.json has no cookies — skipping cookies.txt generation")
+        return
+
+    if os.path.isfile(COOKIES_PATH):
+        # cookies.txt already exists (e.g. the read-only Render secret file) —
+        # only refresh it when the storage session is newer (local dev flow).
+        try:
+            if os.path.getmtime(pw_file) <= os.path.getmtime(COOKIES_PATH):
+                return
+        except OSError:
+            return
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Generated from playwright_storage.json by telegram_bot.py",
+    ]
+    for c in cookies:
+        domain = c.get("domain", "")
+        if "tiktok" not in domain and "byte" not in domain:
+            continue
+        if not domain.startswith("."):
+            domain = "." + domain
+        name = c.get("name", "")
+        value = c.get("value", "")
+        path = c.get("path", "/")
+        secure = c.get("secure", False)
+        expires = c.get("expires", 0)
+        if expires is None or expires <= 0:
+            expires = 1893456000  # Jan 1 2030
+        domain_flag = "TRUE"
+        secure_flag = "TRUE" if secure else "FALSE"
+        lines.append(f"{domain}\t{domain_flag}\t{path}\t{secure_flag}\t{expires}\t{name}\t{value}")
+    try:
         with open(COOKIES_PATH, "w") as f:
             f.write("\n".join(lines) + "\n")
         log.info("Generated %s from %s (%d cookies)", COOKIES_PATH, pw_file, len(cookies))
     except Exception as e:
-        log.warning("Failed to generate cookies.txt: %s", e)
+        log.warning("Could not write %s (read-only secret file?): %s", COOKIES_PATH, e)
 
 
 def _fetch_entries_ytdlp(username: str) -> list[dict] | None:
