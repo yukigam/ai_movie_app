@@ -2791,6 +2791,179 @@ def extract_episodes_sync(url: str, **kw) -> list[dict]:
     return asyncio.run(extract_episodes(url, **kw))
 
 
+# ── Profile "Short dramas" tab extraction ─────────────────────────────────────
+# A short-dramas profile (e.g. @shortdramatime) keeps the REAL series behind
+# the profile's "Short dramas" tab — the default "Videos" tab only shows
+# trailers/clips.  These helpers open the profile, CLICK the tab, enumerate
+# the series cards and return them for the bot to import through the normal
+# full-extraction path (extract_episodes).
+
+_SHORT_DRAMAS_TAB_LABELS = [
+    "short dramas", "short series", "shows", "series",
+    "collections", "сериалы", "короткометражки", "драмы",
+]
+_TAB_EXCLUDE_RE = re.compile(r"videos?|likes|favorites?|favs?|friends?|following|saved|watch|reposts|tags")
+
+
+async def _locate_short_dramas_tab(page, timeout: float = 20.0) -> dict | None:
+    """Return ``{x, y, text}`` of the profile's 'Short dramas' tab button, or
+    None when the tab is not present/tappable on screen."""
+    deadline = time_module.monotonic() + timeout
+    while time_module.monotonic() < deadline:
+        try:
+            found = await page.evaluate("""() => {
+                const want = %s;
+                const exclude = new RegExp(%s);
+                for (const el of document.querySelectorAll(
+                        'button, a, div, span, [role="tab"], [role="button"], [data-e2e*="tab"]')) {
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length > 40) continue;
+                    const low = t.toLowerCase();
+                    if (exclude.test(low)) continue;
+                    if (!want.some(w => low.startsWith(w))) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 &&
+                        r.top >= 0 && r.top < window.innerHeight) {
+                        return { x: Math.round(r.left + r.width / 2),
+                                 y: Math.round(r.top + r.height / 2), text: t };
+                    }
+                }
+                return null;
+            }""" % (json.dumps(_SHORT_DRAMAS_TAB_LABELS), json.dumps(_TAB_EXCLUDE_RE.pattern)))
+        except Exception:
+            found = None
+        if found:
+            return found
+        await asyncio.sleep(1.0)
+    return None
+
+
+async def _click_short_dramas_tab(page, tab: dict) -> None:
+    """Click the located tab with the same JS → mouse fallback pattern as the
+    episode sidebar (JS .click() does not trigger React on some layouts)."""
+    x, y = tab["x"], tab["y"]
+    try:
+        ok = await page.evaluate("""(coords) => {
+            const el = document.elementFromPoint(coords.x, coords.y);
+            let node = el;
+            for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
+                if (node.click && node.textContent) {
+                    node.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", {"x": x, "y": y})
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            await page.mouse.click(x, y)
+        except Exception as e:
+            log.warning("Short dramas tab mouse click failed: %s", str(e)[:80])
+    await page.wait_for_timeout(2500)
+
+
+async def _extract_series_cards(page) -> list[dict]:
+    """Enumerate the visible series cards on the current tab.
+
+    Returns ``[{"title": ..., "url": ...}, ...]`` — URLs pointing to the
+    first-episode pages (or /series/ pages) of each drama.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const cards = [];
+            const seen = new Set();
+            for (const a of document.querySelectorAll('a[href*="/video/"], a[href*="/series/"]')) {
+                const r = a.getBoundingClientRect();
+                if (!(r.width > 0 && r.height > 0)) continue;  // visible only
+                const h = a.getAttribute('href') || '';
+                const url = 'https://www.tiktok.com' + h.split('?')[0];
+                if (seen.has(url)) continue;
+                seen.add(url);
+                let el = a.parentElement, title = '';
+                for (let i = 0; i < 8 && el; i++) {
+                    const t = (el.innerText || '').trim();
+                    if (t) { title = t.split('\\n')[0].trim().slice(0, 120); break; }
+                    el = el.parentElement;
+                }
+                cards.push({ url, title });
+            }
+            return cards;
+        }""")
+    except Exception:
+        return []
+
+
+async def extract_short_dramas(url: str, headless: bool = True, timeout: float = 240.0) -> list[dict]:
+    """Open a TikTok profile page, click its 'Short dramas' tab (skipping the
+    Videos tab), and return the series cards: ``[{"title", "url"}, ...]``.
+
+    Returns [] when the profile has no dramas tab / no series — the caller
+    falls back to the regular videos-tab import.  Never raises.
+    """
+    url = clean_url(url)
+    if "/video/" in url or not url:
+        return []
+
+    async def _run() -> list[dict]:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser, context = await create_playwright_context(p, headless=headless)
+            page = await context.new_page()
+            page.set_default_timeout(15000)
+            cards: list[dict] = []
+            try:
+                await page.goto("https://www.tiktok.com", timeout=30000, wait_until="domcontentloaded")
+                await _random_sleep(2.0, 4.0)
+                await save_storage(context)
+
+                await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                await _random_sleep(4.0, 6.0)
+                await _clear_login_wall(page, url, attempts=2)
+
+                tab = await _locate_short_dramas_tab(page, timeout=15.0)
+                if not tab:
+                    log.info("No 'Short dramas' tab found on %s — scanning videos view for series cards", url)
+                else:
+                    log.info("Clicking 'Short dramas' tab: '%s' at (%s, %s)", tab["text"], tab["x"], tab["y"])
+                    await _click_short_dramas_tab(page, tab)
+
+                deadline = time_module.monotonic() + 45.0
+                while time_module.monotonic() < deadline:
+                    try:
+                        cards = await _extract_series_cards(page)
+                    except Exception:
+                        cards = []
+                    if cards:
+                        break
+                    await asyncio.sleep(2.0)
+
+                if cards:
+                    # Prefer real first-episode video links over /series/ slugs
+                    cards.sort(key=lambda c: 0 if "/video/" in c["url"] else 1)
+                    titles = ", ".join((c["title"] or "?")[:24] for c in cards[:6])
+                    log.info("Found %d series card(s) on %s: %s", len(cards), url, titles)
+                    await save_storage(context)
+                else:
+                    log.warning("No series cards found on %s", url)
+                return cards
+            finally:
+                await browser.close()
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=timeout)
+    except Exception as e:
+        log.error("Short dramas extraction failed for %s: %s", url, str(e)[:160])
+        return []
+
+
+def extract_short_dramas_sync(url: str, **kw) -> list[dict]:
+    """Synchronous wrapper around ``extract_short_dramas()``."""
+    _safe_stdout()
+    return asyncio.run(extract_short_dramas(url, **kw))
+
+
 # ── Login helper ─────────────────────────────────────────────────────────────
 
 async def _do_login():

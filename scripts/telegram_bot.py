@@ -282,18 +282,22 @@ def extract_username(text: str) -> str | None:
 
 
 def is_profile(text: str) -> bool:
+    """True when the message points at a PROFILE (or series/playlist/short-
+    dramas page) rather than a single video.
+
+    Anything on tiktok.com/@user… that is NOT a /video/ URL is treated as a
+    profile-like page — that includes bare @username links, '/short-dramas'
+    tabs, '/series/<slug>' and '/playlist/<id>' pages.
+    """
     t = text.strip()
     if _AT_USER_RE.match(t):
         return True
-    m = _TIKTOK_DOMAIN_RE.match(t)
+    m = _TIKTOK_DOMAIN_RE.search(t)
     if m:
         remainder = t[m.end():]
-        return (
-            not remainder
-            or remainder in ("/", "/?")
-            or remainder.startswith("/series/")
-            or remainder.startswith("/playlist/")
-        )
+        if "/video/" in remainder:
+            return False
+        return True
     return False
 
 
@@ -1424,6 +1428,14 @@ async def _handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool 
 
     try:
         if is_profile(text):
+            # Short-dramas profiles keep the REAL series behind the
+            # "Short dramas" tab — the default Videos tab only carries clips/
+            # trailers.  Try the Playwright tab extraction FIRST, and fall
+            # back to the plain videos-tab import only when it yields nothing.
+            if _playwright_available():
+                imported = await _profile_short_dramas(text, username, status, ctx, force)
+                if imported:
+                    return
             await _profile(username, status, force)
         else:
             # Single video: try series extraction via Playwright first
@@ -1520,6 +1532,72 @@ async def cmd_force(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 BATCH_LIMIT = 50
+
+
+async def _profile_short_dramas(profile_url: str, username: str, msg, ctx, force: bool = False) -> bool:
+    """Profile import via the 'Short dramas' tab.
+
+    Opens the profile with Playwright, clicks the 'Short dramas' tab (never
+    the Videos tab), picks a series (custom-title match first, otherwise the
+    first card) and imports its FULL episode list through the complete
+    series-extraction path.  Returns True when a series import started;
+    False → the caller falls back to the plain videos-tab import.
+    """
+    from tiktok_playwright import extract_short_dramas_sync
+    await _safe_edit(
+        msg,
+        f"🎭 Opening `@{username}`… `Short dramas` tab-ийг хайж байна…",
+        parse_mode="Markdown",
+    )
+    try:
+        cards = await asyncio.wait_for(
+            asyncio.to_thread(extract_short_dramas_sync, profile_url),
+            timeout=240,
+        )
+    except Exception as e:
+        log.warning("Short dramas profile extraction failed: %s", clean_error(e))
+        return False
+    if not cards:
+        return False
+
+    # The custom title (text around the link) picks a specific drama;
+    # otherwise the FIRST card wins.
+    custom_title = ctx.user_data.get("custom_title") if ctx else None
+    target = None
+    if custom_title:
+        clue = str(custom_title).strip().lower()
+        for c in cards:
+            if clue and clue in str(c.get("title") or "").lower():
+                target = c
+                break
+    if not target:
+        target = cards[0]
+
+    tname = target.get("title") or username
+    log.info("Chose series '%s' (%s) from %d card(s) on @%s", tname, target.get("url"), len(cards), username)
+    await _safe_edit(
+        msg,
+        f"🎭 `@{username}` дээр {len(cards)} цуврал олдлоо.\n"
+        f"→ *{tname}* гэсэн цувралын БҮХ ангийг татаж байна…",
+        parse_mode="Markdown",
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def progress_cb(text: str) -> None:
+        asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
+
+    episodes = await asyncio.wait_for(
+        asyncio.to_thread(_extract_episodes_playwright, target["url"], progress_cb),
+        timeout=600,
+    )
+    if len(episodes) > 1:
+        log.info("Profile dramas: %d episodes extracted for '%s'", len(episodes), tname)
+        await _playlist_from_episodes(episodes, msg, series_title=tname, force=force)
+        return True
+
+    log.warning("Series '%s' yielded only %d episode(s) — falling back to videos-tab import", tname, len(episodes))
+    return False
 
 
 async def _profile(username: str, msg, force: bool = False) -> None:
