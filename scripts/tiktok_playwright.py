@@ -189,6 +189,9 @@ async def create_playwright_context(p, headless: bool = True):
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--no-zygote",
+            "--js-flags=--max-old-space-size=128",
             "--disable-extensions",
             "--disable-background-networking",
             "--disable-background-timer-throttling",
@@ -223,6 +226,9 @@ async def create_playwright_context(p, headless: bool = True):
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--no-zygote",
+            "--js-flags=--max-old-space-size=128",
             "--disable-extensions",
             "--disable-background-networking",
             "--disable-background-timer-throttling",
@@ -2985,6 +2991,169 @@ def extract_short_dramas_sync(url: str, **kw) -> list[dict]:
     """Synchronous wrapper around ``extract_short_dramas()``."""
     _safe_stdout()
     return asyncio.run(extract_short_dramas(url, **kw))
+
+
+# ── API-only extraction (NO browser) ─────────────────────────────────────────
+# Chromium is by far the biggest RAM consumer in the bot — on Render Free
+# (512 MB) any browser session risks an OOM kill (status 137).  TikTok embeds
+# the FULL episode payload in the ``__UNIVERSAL_DATA_FOR_REHYDRATION__``
+# script of the video page's HTML, so the series list can be parsed with a
+# single plain httpx GET — zero Chromium, ~5 MB of RAM, ~1-2 s.
+
+def _cookies_header() -> str:
+    """Build a ``Cookie`` header from the best available TikTok session."""
+    cookies = []
+    cf = _cookies_file()
+    if cf:
+        cookies = _parse_netscape_cookies(cf)
+    if not cookies:
+        try:
+            with open(STORAGE_STATE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cookies = data.get("cookies") or []
+        except Exception:
+            cookies = []
+    wanted = [c for c in cookies if "tiktok" in str(c.get("domain", ""))]
+    return "; ".join(f"{c['name']}={c['value']}" for c in wanted)
+
+
+def extract_episodes_api(url: str, timeout: float = 25.0) -> list[dict]:
+    """Extract a series' episode list over plain HTTP — no browser.
+
+    Fetches the video page HTML with httpx (using the saved session cookies)
+    and walks the embedded rehydration JSON the same way the browser's
+    Strategy A does.  Returns the standard episode list ``[{episode, id,
+    url}, ...]`` with ``{"_meta": {...}}`` prepended, or [] when the page
+    carries no series data.  Never raises.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return []
+    if "/video/" not in url:
+        return []  # only video pages embed the series JSON
+
+    url = clean_url(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+        "Cookie": _cookies_header(),
+    }
+    try:
+        resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("API extraction: page fetch failed for %s: %s", url, str(e)[:120])
+        return []
+    html = resp.text
+
+    m = re.search(
+        r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        html, re.S,
+    )
+    if not m:
+        log.info("API extraction: no rehydration data on %s (browser fallback)", url)
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except Exception as e:
+        log.warning("API extraction: rehydration JSON parse failed: %s", str(e)[:80])
+        return []
+    scope = (data or {}).get("__DEFAULT_SCOPE__") or {}
+
+    episode_ids: list[str] = []
+    seen: set[str] = set()
+    username = ""
+    series_title = ""
+    series_cover = ""
+
+    vd = scope.get("webapp.video-detail") or {}
+    item = (vd.get("itemInfo") or {}).get("itemStruct") or {}
+    if isinstance(item, dict):
+        username = ((item.get("author") or {}).get("uniqueId")) or ""
+        series_title = (item.get("title") or "").strip()
+        if not series_title:
+            series_title = (item.get("desc") or "").split("\n")[0].strip()
+        cover_list = ((item.get("video") or {}).get("cover") or {}).get("urlList") or []
+        if cover_list:
+            series_cover = cover_list[0]
+
+    def push(vid) -> None:
+        vid = str(vid or "")
+        if not vid or vid in seen:
+            return
+        seen.add(vid)
+        episode_ids.append(vid)
+
+    def walk(obj) -> None:
+        if not isinstance(obj, dict):
+            return
+        for key in ("itemList", "items", "videos", "videoList",
+                    "episodeList", "episodes", "contents"):
+            entries = obj.get(key)
+            if isinstance(entries, list) and len(entries) > 1:
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    vid = e.get("id") or e.get("video_id") or e.get("ID") or ""
+                    if not vid:
+                        sub = e.get("video")
+                        if isinstance(sub, dict):
+                            vid = sub.get("id") or ""
+                    if not vid and isinstance(e.get("url"), str):
+                        mm = re.search(r"/video/(\d+)", e["url"])
+                        if mm:
+                            vid = mm.group(1)
+                    if vid:
+                        push(vid)
+        for k, v in obj.items():
+            if isinstance(v, dict):
+                walk(v)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+
+    walk(scope)
+
+    # Authors of the episode list — anything authoritative over the scan
+    if isinstance(item, dict):
+        contents = item.get("contents") or []
+        if isinstance(contents, list):
+            for c in contents:
+                if isinstance(c, dict):
+                    push(c.get("id") or "")
+        for rel in (item.get("relatedItemList") or item.get("relatedItems") or []):
+            if isinstance(rel, dict):
+                push(rel.get("id") or "")
+
+    if len(episode_ids) <= 1:
+        return []
+
+    episodes = [
+        {
+            "episode": i + 1,
+            "id": vid,
+            "url": (f"https://www.tiktok.com/@{username}/video/{vid}"
+                    if username else f"https://www.tiktok.com/video/{vid}"),
+        }
+        for i, vid in enumerate(episode_ids)
+    ]
+    log.info("API extraction: %d episodes for %s%s", len(episodes), url,
+             f" ('{series_title}')" if series_title else "")
+    meta = {}
+    if series_title:
+        meta["series_title"] = series_title
+    if series_cover:
+        meta["series_cover"] = series_cover
+    meta["last_ep_num"] = len(episodes)
+    meta["last_ep_url"] = episodes[-1]["url"]
+    episodes.insert(0, {"_meta": meta})
+    return episodes
 
 
 # ── Login helper ─────────────────────────────────────────────────────────────

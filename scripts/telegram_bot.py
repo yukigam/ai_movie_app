@@ -171,6 +171,22 @@ def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
     url = _clean_url(url)
     if not os.path.isfile(PLAYWRIGHT_STORAGE):
         log.info("No saved login state — extraction runs without TikTok session (fresh headless context)")
+
+    # ── Phase 0: a-Pure-HTTP extraction (no Chromium) ─────────────────────
+    # The rehydration JSON embedded in the page HTML — same data the browser
+    # parses — is fetched with plain httpx.  On Render Free (512 MB) ANY
+    # browser session risks an OOM kill; this path keeps the whole import
+    # Chromium-free when possible.
+    try:
+        from tiktok_playwright import extract_episodes_api
+        api_eps = extract_episodes_api(url)
+        if len(api_eps) > 1:
+            log.info("API extraction found %d episodes (no browser session opened)", len(api_eps) - 1)
+            return api_eps
+        log.info("API extraction found nothing — opening the browser as fallback")
+    except Exception as e:
+        log.warning("API extraction skipped (%s) — using browser", clean_error(e))
+
     try:
         from tiktok_playwright import extract_episodes_sync
         import concurrent.futures
