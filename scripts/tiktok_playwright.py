@@ -1802,6 +1802,7 @@ async def extract_episodes(
     headless: bool = True,
     save_on_success: bool = True,
     progress_cb=None,
+    api_meta: dict | None = None,
 ) -> list[dict]:
     """Open a TikTok video/series URL and extract all episode URLs.
 
@@ -1810,6 +1811,11 @@ async def extract_episodes(
       B. **View Series link** — find and click a "View series" link, then extract videos
       C. **Sidebar buttons** — click numbered episode buttons in the right sidebar
       D. **Single video** fallback
+
+    ``api_meta`` (optional) carries official metadata pre-fetched from the
+    page's ``dramaInfo`` JSON WITHOUT a browser (series title, official
+    poster, expected episode count).  It wins over the browser-derived
+    title/cover when present and gates the completeness checks.
 
     Returns a list of ``{"episode": int, "id": str, "url": str}`` sorted by
     episode number, or a single-entry list for non-series videos.
@@ -1826,7 +1832,28 @@ async def extract_episodes(
         Called with a human-readable progress string after each episode is
         processed (and at major milestones).  Must be safe to call from any
         thread; exceptions are swallowed.
+    api_meta : dict | None
+        Official series metadata pre-fetched from the page's ``dramaInfo``
+        JSON WITHOUT a browser (series title, official poster, expected
+        episode count).  Wins over the browser-derived title/cover and
+        gates the completeness checks.
     """
+    def _meta_from_api(title: str, cover: str) -> dict:
+        """Merge metadata — the official dramaInfo values (from the API
+        hint) win over the browser-parsed title/cover."""
+        m = {}
+        t = title or ""
+        if api_meta:
+            t = str(api_meta.get("series_title") or "") or t
+        if t:
+            m["series_title"] = t
+        c = cover or ""
+        if api_meta:
+            c = str(api_meta.get("series_cover") or "") or c
+        if c:
+            m["series_cover"] = c
+        return m
+
     from playwright.async_api import async_playwright
 
     # Web-share query params (is_from_webapp, sender_device, utm_*) make
@@ -2001,7 +2028,7 @@ async def extract_episodes(
                         series_title = await _get_series_title(page)
                         episodes.sort(key=lambda x: x["episode"])
                         if series_title:
-                            episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
+                            episodes.insert(0, {"_meta": _meta_from_api(series_title, series_cover)})
                         log.info("Returning %d episodes from rehydration data", len(episodes))
                         if save_on_success:
                             await save_storage(context)
@@ -2055,7 +2082,7 @@ async def extract_episodes(
                             for i, ep in enumerate(episodes, 1):
                                 ep["episode"] = i
                             if series_title:
-                                episodes.insert(0, {"_meta": {"series_title": series_title, "series_cover": series_cover}})
+                                episodes.insert(0, {"_meta": _meta_from_api(series_title, series_cover)})
                             if save_on_success:
                                 await save_storage(context)
                             await browser.close()
@@ -2647,19 +2674,35 @@ async def extract_episodes(
              if (m := re.match(r"^(\d+)\s*-\s*(\d+)$", str(t)))),
             default=max(len(buttons), len(episodes)),
         )
+        # The official episode count from the page's dramaInfo JSON is
+        # authoritative for the completeness check.
+        api_expected = int(api_meta.get("expected")) if api_meta and api_meta.get("expected") else 0
+        expected = max(int(expected or 0), api_expected)
         total_expected = max(expected, len(episodes))
         log.info("Extracted %d / %d episodes", len(episodes), total_expected)
         print(f"Extraction complete: {len(episodes)}/{total_expected} episodes collected", flush=True)
 
-        if series_title and len(episodes) > 1:
-            meta = {"series_title": series_title}
+        meta_title = None
+        if api_meta:
+            meta_title = str(api_meta.get("series_title") or "").strip()
+        if not meta_title:
+            meta_title = series_title
+        if meta_title:
+            meta = {"series_title": meta_title}
             # The OFFICIAL series cover/poster — the bot uses it as the
-            # series poster (never a random episode thumbnail).
-            if series_cover:
-                meta["series_cover"] = series_cover
-            # Expected final episode (last tab's end) — lets the bot verify
-            # the last episode made it into the DB after download.
-            if isinstance(tab_texts, list) and tab_texts:
+            # series poster (never a random episode thumbnail).  The API's
+            # dramaInfo cover beats the browser-derived one.
+            cover = ""
+            if api_meta:
+                cover = str(api_meta.get("series_cover") or "")
+            if not cover:
+                cover = series_cover or ""
+            if cover:
+                meta["series_cover"] = cover
+            # Expected final episode (dramaInfo count > last tab's end)
+            if api_expected:
+                meta["last_ep_num"] = api_expected
+            elif isinstance(tab_texts, list) and tab_texts:
                 _, last_end = _tab_range(str(tab_texts[-1]))
                 if last_end:
                     meta["last_ep_num"] = last_end
@@ -3018,13 +3061,21 @@ def _cookies_header() -> str:
 
 
 def extract_episodes_api(url: str, timeout: float = 25.0) -> list[dict]:
-    """Extract a series' episode list over plain HTTP — no browser.
+    """Best-effort metadata + episode scan over plain HTTP — no browser.
 
-    Fetches the video page HTML with httpx (using the saved session cookies)
-    and walks the embedded rehydration JSON the same way the browser's
-    Strategy A does.  Returns the standard episode list ``[{episode, id,
-    url}, ...]`` with ``{"_meta": {...}}`` prepended, or [] when the page
-    carries no series data.  Never raises.
+    TikTok's static HTML embeds ``webapp.video-detail.itemInfo.itemStruct``
+    which for SHORT-DRAMAS carries the OFFICIAL ``dramaInfo`` block:
+
+        dramaName  → the real series title ("The Heirless Alpha's Exclusive
+                     Devotion") — never the @account name
+        cover      → the OFFICIAL poster URL ('UrlList')
+        numVideos  → the exact expected episode count (e.g. 69)
+
+    The full episode list is NOT in the static page (only the current video),
+    so the caller must run the browser extraction afterwards — this function
+    returns ``[{"_meta": {...dramaInfo metadata...}}, ...best-effort episodes]``
+    as a HINT for title/cover/completeness gating, never as a final result
+    by itself.  Never raises.
     """
     try:
         import httpx
@@ -3069,19 +3120,34 @@ def extract_episodes_api(url: str, timeout: float = 25.0) -> list[dict]:
     episode_ids: list[str] = []
     seen: set[str] = set()
     username = ""
-    series_title = ""
-    series_cover = ""
+    item_title = ""
+    item_cover = ""
+    drama_title = ""
+    drama_cover = ""
+    drama_expected = 0
 
     vd = scope.get("webapp.video-detail") or {}
     item = (vd.get("itemInfo") or {}).get("itemStruct") or {}
     if isinstance(item, dict):
         username = ((item.get("author") or {}).get("uniqueId")) or ""
-        series_title = (item.get("title") or "").strip()
-        if not series_title:
-            series_title = (item.get("desc") or "").split("\n")[0].strip()
+        item_title = (item.get("title") or "").strip()
+        if not item_title:
+            item_title = (item.get("desc") or "").split("\n")[0].strip()
         cover_list = ((item.get("video") or {}).get("cover") or {}).get("urlList") or []
         if cover_list:
-            series_cover = cover_list[0]
+            item_cover = cover_list[0]
+        # Official short-drama block — the real series name, poster and
+        # episode count (the current video's own fields are NOT those).
+        di = item.get("dramaInfo") or {}
+        if isinstance(di, dict):
+            drama_title = str(di.get("dramaName") or "").strip()
+            try:
+                drama_expected = int(di.get("numVideos") or 0)
+            except (TypeError, ValueError):
+                drama_expected = 0
+            dlist = (di.get("cover") or {}).get("UrlList") or []
+            if dlist:
+                drama_cover = str(dlist[0])
 
     def push(vid) -> None:
         vid = str(vid or "")
@@ -3131,9 +3197,6 @@ def extract_episodes_api(url: str, timeout: float = 25.0) -> list[dict]:
             if isinstance(rel, dict):
                 push(rel.get("id") or "")
 
-    if len(episode_ids) <= 1:
-        return []
-
     episodes = [
         {
             "episode": i + 1,
@@ -3143,17 +3206,29 @@ def extract_episodes_api(url: str, timeout: float = 25.0) -> list[dict]:
         }
         for i, vid in enumerate(episode_ids)
     ]
-    log.info("API extraction: %d episodes for %s%s", len(episodes), url,
-             f" ('{series_title}')" if series_title else "")
     meta = {}
-    if series_title:
-        meta["series_title"] = series_title
-    if series_cover:
-        meta["series_cover"] = series_cover
-    meta["last_ep_num"] = len(episodes)
-    meta["last_ep_url"] = episodes[-1]["url"]
-    episodes.insert(0, {"_meta": meta})
-    return episodes
+    # The OFFICIAL dramaInfo values win over anything the single video carries
+    if drama_title:
+        meta["series_title"] = drama_title
+    elif item_title:
+        meta["series_title"] = item_title
+    if drama_cover:
+        meta["series_cover"] = drama_cover
+    elif item_cover:
+        meta["series_cover"] = item_cover
+    if drama_expected:
+        meta["expected"] = drama_expected
+    if not meta:
+        log.info("API metadata: nothing on %s (browser fallback)", url)
+        return []
+    log.info("API metadata: '%s', %d episodes expected, %d best-effort ids%s",
+             meta.get("series_title", ""), drama_expected, len(episodes),
+             "" if drama_cover else " (no poster)")
+    if episodes:
+        episodes.insert(0, {"_meta": meta})
+        return episodes
+    # No episode list in static HTML — still hand the metadata to the caller
+    return [{"_meta": meta}]
 
 
 # ── Login helper ─────────────────────────────────────────────────────────────

@@ -172,18 +172,28 @@ def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
     if not os.path.isfile(PLAYWRIGHT_STORAGE):
         log.info("No saved login state — extraction runs without TikTok session (fresh headless context)")
 
-    # ── Phase 0: a-Pure-HTTP extraction (no Chromium) ─────────────────────
-    # The rehydration JSON embedded in the page HTML — same data the browser
-    # parses — is fetched with plain httpx.  On Render Free (512 MB) ANY
-    # browser session risks an OOM kill; this path keeps the whole import
-    # Chromium-free when possible.
+    # ── Phase 0: metadata hint over pure HTTP (no Chromium) ──────────────
+    # httpx reads the OFFICIAL dramaInfo block from the page HTML — the real
+    # series name (never the @account name), the official poster and the
+    # expected episode count.  The static HTML does NOT carry the full
+    # episode list, so this only feeds the browser extraction's title/cover/
+    # completeness checks — it early-returns ONLY when the server-side JSON
+    # already proved the complete list (browser then truly unnecessary).
+    api_meta: dict = {}
     try:
         from tiktok_playwright import extract_episodes_api
         api_eps = extract_episodes_api(url)
-        if len(api_eps) > 1:
-            log.info("API extraction found %d episodes (no browser session opened)", len(api_eps) - 1)
-            return api_eps
-        log.info("API extraction found nothing — opening the browser as fallback")
+        if api_eps and isinstance(api_eps[0], dict):
+            api_meta = dict(api_eps[0].get("_meta") or {})
+            api_found = sum(
+                1 for e in api_eps if isinstance(e, dict) and not e.get("_meta")
+            )
+            api_expected = int(api_meta.get("expected") or 0)
+            log.info("API metadata hint: %s",
+                     ", ".join(f"{k}={v}" for k, v in api_meta.items()) or "none")
+            if api_expected and api_found >= api_expected:
+                log.info("API extraction found the FULL list (%d episodes — no browser session opened)", api_found)
+                return api_eps
     except Exception as e:
         log.warning("API extraction skipped (%s) — using browser", clean_error(e))
 
@@ -198,6 +208,7 @@ def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
                 headless=True,
                 save_on_success=True,
                 progress_cb=progress_cb,
+                api_meta=api_meta,
             )
             result = fut.result(timeout=600)
         except concurrent.futures.TimeoutError:
