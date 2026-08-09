@@ -120,7 +120,6 @@ MAX_UPLOAD_ATTEMPTS = 5  # re-download+re-upload rounds inside _insert
 # then covers anything still missing.
 IMMEDIATE_RETRIES = 3
 COOKIES_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cookies.txt")
-PLAYWRIGHT_STORAGE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "playwright_storage.json")
 
 SSSTIK_URL = "https://ssstik.io"
 
@@ -131,109 +130,26 @@ def _clean_url(url: str) -> str:
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") or ""
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "tiktok-downloader-download-tiktok-videos-no-watermark.p.rapidapi.com")
 
-# ── Playwright (optional) ──────────────────────────────────────────────────
+# ── Series extraction (pure HTTP — no browser) ──────────────────────────────
 
-def _playwright_available() -> bool:
-    """Return True if series extraction can be attempted.
+def _extract_episodes(url: str, progress_cb=None) -> list[dict]:
+    """Extract a TikTok series' full episode list over plain HTTP.
 
-    A saved login state (playwright_storage.json) is preferred but NOT
-    required: on Render the file does not exist (fresh container, no
-    volumes), so the bot must still try extraction — the headless context
-    simply starts without cookies and the login-wall is dismissed in-page.
+    Engine: scripts/tiktok_series.py — httpx for the page's official
+    ``dramaInfo`` metadata (real series name, poster, expected episode
+    count) + yt-dlp's TikTok user extractor for the account's video list
+    (paginated internal API, ~15 MB RAM, no browser).
+
+    Returns [] on failure (degrade to single-video import).  The first
+    entry may carry ``{"_meta": {"series_title": ..., "series_cover": ...,
+    "last_ep_num": ...}}``.  ``progress_cb`` receives human-readable
+    progress strings from the extraction thread.
     """
-    if os.path.isfile(PLAYWRIGHT_STORAGE):
-        return True
     try:
-        import playwright  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-def _extract_episodes_playwright(url: str, progress_cb=None) -> list[dict]:
-    """Extract episode URLs via Playwright. Returns [] on failure.
-    
-    Tries multiple strategies:
-      1. Rehydration data scanning (no browser rendering needed)
-      2. View Series link detection
-      3. Sidebar episode button clicking
-      4. Single video fallback
-    
-    First entry may contain ``{"_meta": {"series_title": "..."}}`` metadata.
-    ``progress_cb`` (optional) is called with human-readable progress strings
-    from the extraction thread.
-    """
-    if not _playwright_available():
-        log.info("Playwright storage not found — skipping series extraction")
-        return []
-    # Web-share tracking params (is_from_webapp, sender_device, utm_*) make
-    # TikTok serve a CAPTCHA — strip them BEFORE navigating (this was the
-    # "only 1 episode" root cause).
-    url = _clean_url(url)
-    if not os.path.isfile(PLAYWRIGHT_STORAGE):
-        log.info("No saved login state — extraction runs without TikTok session (fresh headless context)")
-
-    # ── Phase 0: metadata hint over pure HTTP (no Chromium) ──────────────
-    # httpx reads the OFFICIAL dramaInfo block from the page HTML — the real
-    # series name (never the @account name), the official poster and the
-    # expected episode count.  The static HTML does NOT carry the full
-    # episode list, so this only feeds the browser extraction's title/cover/
-    # completeness checks — it early-returns ONLY when the server-side JSON
-    # already proved the complete list (browser then truly unnecessary).
-    api_meta: dict = {}
-    try:
-        from tiktok_playwright import extract_episodes_api
-        api_eps = extract_episodes_api(url)
-        if api_eps and isinstance(api_eps[0], dict):
-            api_meta = dict(api_eps[0].get("_meta") or {})
-            api_found = sum(
-                1 for e in api_eps if isinstance(e, dict) and not e.get("_meta")
-            )
-            api_expected = int(api_meta.get("expected") or 0)
-            log.info("API metadata hint: %s",
-                     ", ".join(f"{k}={v}" for k, v in api_meta.items()) or "none")
-            if api_expected and api_found >= api_expected:
-                log.info("API extraction found the FULL list (%d episodes — no browser session opened)", api_found)
-                return api_eps
+        from tiktok_series import extract_series
+        return extract_series(url, progress_cb)
     except Exception as e:
-        log.warning("API extraction skipped (%s) — using browser", clean_error(e))
-
-    try:
-        from tiktok_playwright import extract_episodes_sync
-        import concurrent.futures
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        try:
-            fut = pool.submit(
-                extract_episodes_sync,
-                url,
-                headless=True,
-                save_on_success=True,
-                progress_cb=progress_cb,
-                api_meta=api_meta,
-            )
-            result = fut.result(timeout=600)
-        except concurrent.futures.TimeoutError:
-            log.error("Playwright extraction timed out (>600s) for %s", url)
-            result = []
-        except Exception as e:
-            log.error("Playwright extraction crashed for %s: %s", url, clean_error(e))
-            result = []
-        finally:
-            # Abandon a wedged worker instead of blocking on shutdown(wait=True)
-            # — a stuck Playwright thread must never freeze the bot.
-            pool.shutdown(wait=False)
-        log.info("Playwright returned %d episodes for %s", len(result), url)
-        if len(result) > 1:
-            meta_str = ""
-            if result[0].get("_meta"):
-                meta_str = f" — series: {result[0]['_meta'].get('series_title', '?')}"
-                log.info("Series detected: %d episodes%s", len(result) - 1, meta_str)
-        elif len(result) == 1:
-            log.info("Single video detected (no series found)")
-        return result
-    except Exception as e:
-        import traceback
-        log.warning("Playwright extraction failed for %s: %s", url, e)
-        log.debug("Playwright traceback:\n%s", traceback.format_exc())
+        log.warning("Series extraction failed for %s: %s", url, clean_error(e))
         return []
 
 # ── ANSI / cleanup helpers ──────────────────────────────────────────────────
@@ -756,36 +672,13 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
         return None
 
 
-def _fetch_video_playwright(url: str, custom_title: str | None = None) -> dict | None:
-    """Fallback: extract video URL directly via Playwright.
-    
-    Opens a headless browser, navigates to the TikTok page, and extracts
-    the MP4 URL from rehydration data or the <video> element.
-    """
-    if not _playwright_available():
-        log.info("Playwright storage not found — skipping Playwright direct download")
-        return None
-    try:
-        from tiktok_playwright import extract_video_sync
-        result = extract_video_sync(url, headless=True)
-        if not result:
-            return None
-        if custom_title:
-            result["title"] = custom_title
-        return result
-    except Exception as e:
-        log.warning("Playwright direct download failed for %s: %s", url, clean_error(e))
-        return None
-
-
 def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
     """Extract video from a TikTok URL.
     
-    Download chain:
+    Download chain (pure HTTP — no browser):
       1. yt-dlp (with cookies) — downloads actual bytes, most reliable  
       2. ssstik.io — free downloader
       3. TikWM API — free API
-      4. Playwright direct — headless browser (last resort)
     
     If *custom_title* is provided it overrides the extracted title.
     Returns a dict with ``_video_bytes`` if the video was actually downloaded.
@@ -816,69 +709,8 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
         if result:
             return result
 
-    # 5. Playwright direct
-    log.info("all downloaders failed for %s, trying Playwright direct", url)
-    return _fetch_video_playwright(url, custom_title)
-
-
-def _ensure_cookies():
-    """Convert playwright_storage.json → cookies.txt (Netscape format).
-
-    Never crashes and never clobbers an existing cookies.txt:
-    - no storage file / empty file (the container entrypoint pre-creates an
-      empty one) / unparseable JSON / zero cookies → skipped silently
-    - an existing cookies.txt (e.g. the read-only Render secret file) is
-      left untouched unless the storage session is NEWER than it.
-    """
-    pw_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "playwright_storage.json")
-    try:
-        if not os.path.isfile(pw_file) or os.path.getsize(pw_file) < 20:
-            log.debug("No usable playwright_storage.json yet — skipping cookies.txt generation")
-            return
-        with open(pw_file, encoding="utf-8") as f:
-            data = json.load(f)
-        cookies = data.get("cookies", []) if isinstance(data, dict) else []
-    except Exception as e:
-        log.debug("playwright_storage.json not parseable (%s) — skipping cookies.txt generation", e)
-        return
-    if not cookies:
-        log.debug("playwright_storage.json has no cookies — skipping cookies.txt generation")
-        return
-
-    if os.path.isfile(COOKIES_PATH):
-        # cookies.txt already exists (e.g. the read-only Render secret file) —
-        # only refresh it when the storage session is newer (local dev flow).
-        try:
-            if os.path.getmtime(pw_file) <= os.path.getmtime(COOKIES_PATH):
-                return
-        except OSError:
-            return
-    lines = [
-        "# Netscape HTTP Cookie File",
-        "# Generated from playwright_storage.json by telegram_bot.py",
-    ]
-    for c in cookies:
-        domain = c.get("domain", "")
-        if "tiktok" not in domain and "byte" not in domain:
-            continue
-        if not domain.startswith("."):
-            domain = "." + domain
-        name = c.get("name", "")
-        value = c.get("value", "")
-        path = c.get("path", "/")
-        secure = c.get("secure", False)
-        expires = c.get("expires", 0)
-        if expires is None or expires <= 0:
-            expires = 1893456000  # Jan 1 2030
-        domain_flag = "TRUE"
-        secure_flag = "TRUE" if secure else "FALSE"
-        lines.append(f"{domain}\t{domain_flag}\t{path}\t{secure_flag}\t{expires}\t{name}\t{value}")
-    try:
-        with open(COOKIES_PATH, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        log.info("Generated %s from %s (%d cookies)", COOKIES_PATH, pw_file, len(cookies))
-    except Exception as e:
-        log.warning("Could not write %s (read-only secret file?): %s", COOKIES_PATH, e)
+    log.info("all downloaders failed for %s", url)
+    return None
 
 
 def _fetch_entries_ytdlp(username: str) -> list[dict] | None:
@@ -1294,8 +1126,8 @@ class Store:
 # pushed onto ONE asyncio.Queue and processed by a single worker task, one
 # job at a time.  A 69-episode series import must finish BEFORE the next
 # link is even started — this guarantees:
-#   • no two imports fight over the Playwright browser / TikTok rate limits
-#   • at most ONE browser is ever alive → RAM usage stays bounded
+#   • no two imports fight over TikTok rate limits
+#   • at most ONE HTTP import is ever alive → RAM usage stays bounded
 #   • the user sees a deterministic queue position instead of chaos
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 _job_worker_task: asyncio.Task | None = None
@@ -1342,7 +1174,7 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 *TikTok → Supabase Bot*\n\n"
         "**Series Import** (auto-detect full series from a video URL)\n"
         "• Send any TikTok video URL from a drama/series\n"
-        "• Bot extracts all episodes via Playwright & imports them\n"
+        "• Bot extracts all episodes via HTTP & imports them\n"
         "• Requires: run `/login` once first\n\n"
         "**Manual Series Import**\n"
         "• `/series <url>` — extract episodes from a specific video\n\n"
@@ -1365,32 +1197,18 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_login(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log in to TikTok manually so Playwright can use the session."""
+    """Legacy command — browser login is gone; HTTP needs no session."""
     await upd.message.reply_text(
-        "⏳ Opening TikTok login in your browser…\n\n"
-        "After you log in, the bot will save the session and use it "
-        "for future series extraction.",
+        "ℹ️ Browser login is no longer needed — the bot runs 100% via HTTP "
+        "(httpx + yt-dlp).\n"
+        "Cookies remain supported via `cookies.txt` (project root) or "
+        "`TIKTOK_COOKIES_FILE`.",
+        parse_mode="Markdown",
     )
-    try:
-        from tiktok_playwright import _do_login as _pw_login
-        await asyncio.to_thread(lambda: asyncio.run(_pw_login()))
-        if _playwright_available():
-            await upd.message.reply_text("✓ Login successful! Session saved.")
-        else:
-            await upd.message.reply_text("✗ Login was not completed or session was not saved.")
-    except Exception as e:
-        await upd.message.reply_text(f"❌ Login failed: {e}")
 
 
 async def cmd_series(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Extract all episodes from a TikTok series/playlist URL."""
-    if not _playwright_available():
-        await upd.message.reply_text(
-            "❌ Playwright session not found.\n\n"
-            "Run /login first to authenticate with TikTok."
-        )
-        return
-
     args = ctx.args
     if not args:
         await upd.message.reply_text("Usage: /series <tiktok-video-url>")
@@ -1455,50 +1273,42 @@ async def _handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool 
 
     try:
         if is_profile(text):
-            # Short-dramas profiles keep the REAL series behind the
-            # "Short dramas" tab — the default Videos tab only carries clips/
-            # trailers.  Try the Playwright tab extraction FIRST, and fall
-            # back to the plain videos-tab import only when it yields nothing.
-            if _playwright_available():
-                imported = await _profile_short_dramas(text, username, status, ctx, force)
-                if imported:
-                    return
+            # Profile import is pure HTTP already (yt-dlp + scraping chain).
             await _profile(username, status, force)
         else:
-            # Single video: try series extraction via Playwright first
-            if _playwright_available() and not ctx.user_data.get("skip_series"):
-                await _safe_edit(status, "🔍 Checking for series episodes…")
-                loop = asyncio.get_running_loop()
+            # Single video: series extraction via pure HTTP first
+            await _safe_edit(status, "🔍 Checking for series episodes…")
+            loop = asyncio.get_running_loop()
 
-                def progress_cb(text):
-                    asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop)
+            def progress_cb(text):
+                asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop)
 
-                episodes = await asyncio.wait_for(
-                    asyncio.to_thread(_extract_episodes_playwright, text, progress_cb),
-                    timeout=600,
-                )
-                if len(episodes) > 1:
-                    log.info("Found %d episodes via Playwright, importing series", len(episodes))
-                    # Warn when extraction came back far short of the series'
-                    # real total (e.g. 6/60 after a network failure) — the
-                    # user must never see a silently partial import.
-                    try:
-                        meta = episodes[0].get("_meta") or {}
-                        last_ep = meta.get("last_ep_num")
-                        found = len(episodes) - 1
-                        if last_ep and found < last_ep - 2:
-                            await _safe_edit(status, f"⚠️ Зөвхөн {found}/{last_ep} анги олдлоо — "
-                                                     f"олдсоныг нь импортлож эхэлж байна.\n"
-                                                     f"Дараа нь линкийг дахин илгээвэл үлдсэн ангиуд нөхөгдөнө.")
-                    except Exception:
-                        pass
-                    await _playlist_from_episodes(episodes, status, force=force)
-                    return
-                elif episodes:
-                    log.info("Playwright: only current video detected (no series grid) — importing as single")
-                    await _safe_edit(status, "⚠️ No series playlist detected — importing this video only")
-                else:
-                    log.info("Playwright extraction returned empty — falling through to single")
+            episodes = await asyncio.wait_for(
+                asyncio.to_thread(_extract_episodes, text, progress_cb),
+                timeout=600,
+            )
+            if len(episodes) > 1:
+                log.info("Found %d episodes via HTTP extraction, importing series", len(episodes))
+                # Warn when extraction came back far short of the series'
+                # real total (e.g. 6/60 after a network failure) — the
+                # user must never see a silently partial import.
+                try:
+                    meta = episodes[0].get("_meta") or {}
+                    last_ep = meta.get("last_ep_num")
+                    found = len(episodes) - 1
+                    if last_ep and found < last_ep - 2:
+                        await _safe_edit(status, f"⚠️ Зөвхөн {found}/{last_ep} анги олдлоо — "
+                                                 f"олдсоныг нь импортлож эхэлж байна.\n"
+                                                 f"Дараа нь линкийг дахин илгээвэл үлдсэн ангиуд нөхөгдөнө.")
+                except Exception:
+                    pass
+                await _playlist_from_episodes(episodes, status, force=force)
+                return
+            elif episodes:
+                log.info("HTTP extraction: only current video detected (no series) — importing as single")
+                await _safe_edit(status, "⚠️ No series playlist detected — importing this video only")
+            else:
+                log.info("HTTP extraction returned empty — falling through to single")
             await _single(text, status, ctx, force)
     except Exception as e:
         log.exception("Handler error")
@@ -1559,72 +1369,6 @@ async def cmd_force(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 BATCH_LIMIT = 50
-
-
-async def _profile_short_dramas(profile_url: str, username: str, msg, ctx, force: bool = False) -> bool:
-    """Profile import via the 'Short dramas' tab.
-
-    Opens the profile with Playwright, clicks the 'Short dramas' tab (never
-    the Videos tab), picks a series (custom-title match first, otherwise the
-    first card) and imports its FULL episode list through the complete
-    series-extraction path.  Returns True when a series import started;
-    False → the caller falls back to the plain videos-tab import.
-    """
-    from tiktok_playwright import extract_short_dramas_sync
-    await _safe_edit(
-        msg,
-        f"🎭 Opening `@{username}`… `Short dramas` tab-ийг хайж байна…",
-        parse_mode="Markdown",
-    )
-    try:
-        cards = await asyncio.wait_for(
-            asyncio.to_thread(extract_short_dramas_sync, profile_url),
-            timeout=240,
-        )
-    except Exception as e:
-        log.warning("Short dramas profile extraction failed: %s", clean_error(e))
-        return False
-    if not cards:
-        return False
-
-    # The custom title (text around the link) picks a specific drama;
-    # otherwise the FIRST card wins.
-    custom_title = ctx.user_data.get("custom_title") if ctx else None
-    target = None
-    if custom_title:
-        clue = str(custom_title).strip().lower()
-        for c in cards:
-            if clue and clue in str(c.get("title") or "").lower():
-                target = c
-                break
-    if not target:
-        target = cards[0]
-
-    tname = target.get("title") or username
-    log.info("Chose series '%s' (%s) from %d card(s) on @%s", tname, target.get("url"), len(cards), username)
-    await _safe_edit(
-        msg,
-        f"🎭 `@{username}` дээр {len(cards)} цуврал олдлоо.\n"
-        f"→ *{tname}* гэсэн цувралын БҮХ ангийг татаж байна…",
-        parse_mode="Markdown",
-    )
-
-    loop = asyncio.get_running_loop()
-
-    def progress_cb(text: str) -> None:
-        asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
-
-    episodes = await asyncio.wait_for(
-        asyncio.to_thread(_extract_episodes_playwright, target["url"], progress_cb),
-        timeout=600,
-    )
-    if len(episodes) > 1:
-        log.info("Profile dramas: %d episodes extracted for '%s'", len(episodes), tname)
-        await _playlist_from_episodes(episodes, msg, series_title=tname, force=force)
-        return True
-
-    log.warning("Series '%s' yielded only %d episode(s) — falling back to videos-tab import", tname, len(episodes))
-    return False
 
 
 async def _profile(username: str, msg, force: bool = False) -> None:
@@ -1698,16 +1442,16 @@ async def _single(url: str, msg, ctx: ContextTypes.DEFAULT_TYPE | None = None, f
 
 
 async def _playlist(url: str, msg, force: bool = False) -> None:
-    """Extract episodes from a series URL and import them."""
-    await _safe_edit(msg, "⏳ Launching browser to extract episodes…")
+    """Extract episodes from a series URL and import them (pure HTTP)."""
+    await _safe_edit(msg, "⏳ Extracting episodes over HTTP…")
     loop = asyncio.get_running_loop()
 
     def progress_cb(text):
         asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
 
     episodes = await asyncio.wait_for(
-        asyncio.to_thread(_extract_episodes_playwright, url, progress_cb),
-        timeout=600,
+        asyncio.to_thread(_extract_episodes, url, progress_cb),
+        timeout=300,
     )
     if not episodes:
         await _safe_edit(msg, "❌ No episodes found. Is this video part of a series?")
@@ -1790,7 +1534,7 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
 
     # ── Strict retry pass: every failed episode is re-fetched up to
     #    MAX_FETCH_ATTEMPTS times.  Each attempt runs the FULL fallback
-    #    chain (yt-dlp → ssstik → TikWM → Playwright).  Episodes still
+    #    chain (yt-dlp → ssstik → TikWM).  Episodes still
     #    failing after that are queued for _insert's own retry pass —
     #    a series is never reported complete while any episode is missing.
     if failed:
@@ -2095,7 +1839,7 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
 
     # ── Strict retry pass: re-download + re-upload every failed episode,
     #    up to MAX_UPLOAD_ATTEMPTS rounds.  Each attempt runs the full
-    #    fallback chain (yt-dlp → ssstik → TikWM → Playwright).
+    #    fallback chain (yt-dlp → ssstik → TikWM).
     if failed:
         for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
             if not failed:
@@ -2309,9 +2053,6 @@ def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("ERROR: EXPO_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env")
         sys.exit(1)
-
-    # Ensure cookies.txt from playwright_storage.json
-    _ensure_cookies()
 
     # Verify storage bucket at startup
     db = create_client(SUPABASE_URL, SUPABASE_KEY)

@@ -50,8 +50,7 @@ clean_caption = telegram_bot.clean_caption
 is_garbage_title = telegram_bot.is_garbage_title
 SUPABASE_URL = telegram_bot.SUPABASE_URL
 SUPABASE_KEY = telegram_bot.SUPABASE_KEY
-playwright_available = telegram_bot._playwright_available
-extract_episodes_playwright = telegram_bot._extract_episodes_playwright
+extract_episodes = telegram_bot._extract_episodes
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
@@ -166,15 +165,12 @@ def scrape_batch(req: BatchRequest):
 
 @app.post("/scrape-series")
 def scrape_series(req: ScrapeRequest):
-    """Extract all episodes from a TikTok series/playlist via Playwright."""
-    if not playwright_available():
-        raise HTTPException(400, "Playwright session not found. Run login_tiktok.py first.")
-
+    """Extract all episodes from a TikTok series URL over pure HTTP."""
     url = _normalise_url(req.url)
     if not url:
         raise HTTPException(400, "Invalid or unresolvable TikTok URL")
 
-    episodes = extract_episodes_playwright(url)
+    episodes = extract_episodes(url)
     if not episodes:
         raise HTTPException(404, "No episodes found in this series")
 

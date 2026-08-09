@@ -1,6 +1,6 @@
 """
-Full pipeline test: TikTok series URL → Playwright extraction → ssstik
-download → Supabase Storage + DB insert.
+Full pipeline test: TikTok series URL → HTTP extraction (httpx + yt-dlp,
+no browser) → download → Supabase Storage + DB insert.
 
 Mimics exactly what telegram_bot.py does when a user sends a series URL,
 using a mock message object that logs instead of sending to Telegram.
@@ -8,7 +8,6 @@ using a mock message object that logs instead of sending to Telegram.
 import asyncio
 import logging
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,7 +20,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("pipeline_test")
 
-TEST_URL = "https://www.tiktok.com/@shortdramatime/video/7666143423493164308"
+TEST_URL = "https://www.tiktok.com/@drama_peak/video/7651505233549348110"
 MAX_DOWNLOADS = 3  # download only first N episodes to keep test fast
 
 
@@ -41,11 +40,11 @@ class MockMessage:
 async def main() -> None:
     msg = MockMessage()
 
-    # ── Step 1: extract episodes via Playwright (same code path as the bot) ──
-    log.info("STEP 1: extracting episodes via Playwright...")
+    # ── Step 1: extract episodes via pure HTTP (same code path as the bot) ──
+    log.info("STEP 1: extracting episodes over HTTP (no browser)...")
     episodes = await asyncio.wait_for(
-        asyncio.to_thread(telegram_bot._extract_episodes_playwright, TEST_URL),
-        timeout=600,
+        asyncio.to_thread(telegram_bot._extract_episodes, TEST_URL),
+        timeout=300,
     )
     n_eps = sum(1 for e in episodes if isinstance(e, dict) and "_meta" not in e)
     log.info("Extraction returned %d episodes", n_eps)
@@ -55,7 +54,7 @@ async def main() -> None:
 
     for e in episodes:
         if isinstance(e, dict) and "_meta" not in e:
-            log.info("  EP %s -> %s", e["episode"], e["id"])
+            log.info("  EP %s -> %s", e["episode"], e.get("url", "?"))
 
     # ── Step 2: download video sources for first N episodes ──────────────────
     log.info("STEP 2: downloading video sources for first %d episodes...", MAX_DOWNLOADS)
