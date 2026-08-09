@@ -249,6 +249,29 @@ async def create_playwright_context(p, headless: bool = True):
         storage_state=_load_storage_state(),
     )
 
+    # ── RAM saver: never load images/fonts ────────────────────────────────
+    # TikTok is fully JS-rendered; the discarded payloads (thumbnails,
+    # avatars, cover art, icon fonts) make up the bulk of Chromium's RSS.
+    # DOM reads, coordinates and the CDN video capturer all keep working —
+    # the video <video> element data (media) and its JSON APIs (xhr/fetch)
+    # are ALLOWED: the downloader + sidebar extraction depend on them.
+    # NOTE: stylesheets stay allowed on purpose — the extraction tracks
+    # element rectangles across real layouts; blocking CSS would shift them.
+    async def _block_heavy_routes(route):
+        try:
+            rtype = route.request.resource_type or ""
+            if rtype in ("image", "font"):
+                await route.abort()
+                return
+            await route.continue_()
+        except Exception:
+            pass
+
+    try:
+        await context.route("**/*", _block_heavy_routes)
+    except Exception as e:
+        log.warning("Resource blocking route not installed: %s", str(e)[:80])
+
     # Remove webdriver detection + mimic real browser
     await context.add_init_script("""
         // Core anti-detection

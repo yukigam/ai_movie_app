@@ -1621,6 +1621,9 @@ async def _profile(username: str, msg, force: bool = False) -> None:
         results = await asyncio.gather(*batch)
         for r in results:
             if r and r.get("video_url"):
+                # Stream, don't accumulate: raw bytes for 50 videos would
+                # blow the container RAM — upload re-fetches the CDN URL.
+                r.pop("_video_bytes", None)
                 videos.append(r)
         await _safe_edit(
             msg,
@@ -1745,6 +1748,12 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
             elif not data.get("title"):
                 data["title"] = f"EP.{data['_ep']}"
             data["_page_url"] = ep_url
+            # STREAMING, NOT ACCUMULATING: do not keep this episode's raw
+            # video bytes in the list — 40–50 episodes × 30–60 MB would OOM
+            # the container before _insert even runs.  The upload step
+            # re-fetches the CDN URL once at insert time (quick re-download,
+            # bounded RAM).
+            data.pop("_video_bytes", None)
             videos.append(data)
             log.info("Extractor OK for EP %s: %s", ep['episode'], ep_url)
         else:
@@ -1795,6 +1804,7 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
                     elif not data.get("title"):
                         data["title"] = f"EP.{data['_ep']}"
                     data["_page_url"] = ep_url
+                    data.pop("_video_bytes", None)
                     videos.append(data)
                     log.info("Retry OK for EP %s (attempt %d, timeout %.0fs)",
                              ep["episode"], attempt, timeout)
@@ -2283,12 +2293,27 @@ def main() -> None:
     else:
         log.warning("! Storage bucket '%s' unavailable — will store tikcdn.io URLs directly", STORAGE_BUCKET)
 
+    async def _post_init(app: Application) -> None:
+        """Run once per polling start: delete any stale webhook.
+
+        A leftover webhook URL (set by an earlier experiment or a previous
+        deploys) makes Telegram reject `getUpdates` with 409 Conflict.
+        Clearing it here — on the SAME event loop that polling will use —
+        is the only reliable spot before run_polling starts.
+        """
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            log.info("Stale webhook cleared before polling")
+        except Exception as e:
+            log.warning("Could not clear webhook before polling: %s", clean_error(e))
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .read_timeout(300)
         .write_timeout(300)
         .connect_timeout(300)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2317,16 +2342,21 @@ def main() -> None:
     # ── Polling loop with single-instance protection ──────────────────────
     # Render's rolling deploys briefly run TWO containers with the same
     # bot token → Telegram throws `Conflict: terminated by other getUpdates
-    # request`.  Instead of crashing, the bot logs it and retries until the
-    # old instance has released the webhook/polling lock.
-    # `drop_pending_updates` skips any stale updates queued while down.
+    # request`.  Instead of crashing, the bot waits with an escalating
+    # backoff (60s → 300s) until the old instance has released the polling
+    # lock.  `drop_pending_updates` skips stale updates queued while down.
+    backoff = 60
     while True:
         try:
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
             break  # graceful shutdown (KeyboardInterrupt / /stop)
         except Conflict as e:
-            log.warning("Telegram Conflict (another instance polling) — retrying in 60s: %s", e)
-            time.sleep(60)
+            log.warning(
+                "Telegram Conflict (another instance polling) — retrying in %ds: %s",
+                backoff, e,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 
 if __name__ == "__main__":
