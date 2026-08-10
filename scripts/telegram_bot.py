@@ -53,13 +53,13 @@ log = logging.getLogger("ttbot")
 
 # ── Render keep-alive HTTP server (deployment only, no bot logic) ────────────
 # Render kills a Web Service if its port stays silent, and a polling bot never
-# accepts connections.  This minimal built-in server answers 200 OK on the
-# Render-provided PORT.  It starts ONLY when this file is run as a script
-# (python scripts/telegram_bot.py); module imports (test_pipeline,
-# tiktok_webhook, clean_and_redownload) are unaffected.  On Render the HTTP
-# server runs in the MAIN thread (`serve_forever`) and the bot polls from a
-# daemon thread — Render's startup/health probes are answered immediately and
-# can never be starved by the bot's work, so the instance never times out.
+# accepts connections.  The health server runs in a daemon THREAD and the
+# bot's asyncio event loop stays in the MAIN thread — Python 3.12 forbids
+# creating an event loop in a background thread (`set_wakeup_fd only works in
+# main thread`), so the polling must never leave the main thread.  It starts
+# ONLY when this file is run as a script (python scripts/telegram_bot.py);
+# module imports (test_pipeline, tiktok_webhook, clean_and_redownload) are
+# unaffected.
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802  (stdlib naming)
         self._answer()
@@ -81,24 +81,19 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-_HEALTH_SERVER: HTTPServer | None = None
-
-
-def start_health_server() -> HTTPServer | None:
-    """Bind the Render keep-alive HTTP server on 0.0.0.0:$PORT (default
-    10000 — Render's convention).  Returns the server object so main() can
-    `serve_forever()` on it; the first call wins, later calls are no-ops."""
-    global _HEALTH_SERVER
-    if _HEALTH_SERVER is not None:
-        return _HEALTH_SERVER
+def start_health_server() -> None:
+    """Serve the Render keep-alive 200 on 0.0.0.0:$PORT (default 10000) from
+    a daemon thread.  Returns immediately; the bot owns the main thread."""
     port = int(os.environ.get("PORT", "10000"))
     try:
-        _HEALTH_SERVER = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
     except Exception as e:
         log.warning("! Health server on port %s failed to start: %s", port, e)
-        return None
-    log.info("✓ Render health server bound on 0.0.0.0:%s", port)
-    return _HEALTH_SERVER
+        return
+    threading.Thread(
+        target=server.serve_forever, daemon=True, name="render-health"
+    ).start()
+    log.info("✓ Render health server listening on 0.0.0.0:%s", port)
 
 
 if __name__ == "__main__":
@@ -1691,17 +1686,17 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     # been uploaded to Supabase.
     await _insert(msg, videos, force, official_total=last_ep_num)
 
-    # ── Top-up loop (DB об the OFFICIAL total): the conversation NEVER ends
+    # ── Top-up loop (DB vs the OFFICIAL total): the conversation NEVER ends
     #    while the database holds fewer than N healthy episodes (e.g. only 2
     #    of 50).  Each round re-extracts the series and imports exactly the
-    #    still-missing numbers (3..50); rounds are spaced out so a rate-
-    #    limited TikTok window does not block the walk forever.
+    #    still-missing numbers (3..50); waits escalate (12s → 90s) so a
+    #    rate-limited TikTok window does not block the walk forever.
     if last_ep_num and series_title:
         skey = slug_id(series_title)
         seed = last_ep_url or (episodes[0]["url"] if episodes else None)
         store = Store()
-        topup_rounds = 3
-        for rnd in range(1, topup_rounds + 1):
+        topup_waits = [12, 20, 30, 45, 60, 90]
+        for rnd in range(1, len(topup_waits) + 1):
             have = _healthy_db_episodes(store, skey, last_ep_num)
             missing = sorted({n for n in range(1, last_ep_num + 1)} - have)
             if not missing or not seed:
@@ -1712,7 +1707,7 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
             await _safe_edit(
                 msg,
                 f"🔄 Дутуу {len(missing)} анги илэрлээ ({missing_str}) — "
-                f"татаж нэмж байна ({rnd}/{topup_rounds})…",
+                f"татаж нэмж байна ({rnd}/{len(topup_waits)})…",
             )
             imported_any = False
             try:
@@ -1741,9 +1736,9 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
                     imported_any = True
             except Exception as e:
                 log.warning("Top-up round %d failed: %s", rnd, clean_error(e))
-            if not imported_any:
-                # extraction still short — let a rate-limit window pass quietly
-                await asyncio.sleep(12)
+            log.info("Top-up round %d done (imported_any=%s)", rnd, imported_any)
+            if not imported_any and rnd < len(topup_waits):
+                await asyncio.sleep(topup_waits[rnd - 1])
 
 
 # ── Insertion ───────────────────────────────────────────────────────────────
@@ -2154,20 +2149,35 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             f"Амжилтгүй ангиудыг 'pending' төлөвт тэмдэглэсэн — дараагийн импортод автоматаар нөхөгдөнө."
         )
     else:
+        incomplete = db_total_known and len(db_have) < official_total
         if inserted == 0 and skipped > 0:
-            if db_total_known and len(db_have) < official_total:
+            if incomplete:
                 status_line = (
                     f"⚠️ *Бүрэн биш:* өгөгдлийн санд зөвхөн "
                     f"{len(db_have)}/{official_total} анги л байна — "
                     f"үлдсэн {official_total - len(db_have)} ангийг нөхөхөд "
                     f"цувралын дурын видеог дахин илгээнэ үү."
                 )
-            else:
+            elif db_total_known:
                 status_line = (
                     f"ℹ️ *Бүх анги аль хэдийн оруулсан байна* (нийт {skipped} ангийг давхар шалгаж, "
                     f"шинийг нэмэх шаардлагагүй байлаа).\n"
                     f"Киноны нэр: {titles}"
                 )
+            else:
+                # No official total available (regular playlist account) —
+                # never claim a series is complete without that guarantee.
+                status_line = (
+                    f"ℹ️ {skipped} анги давхар шалгагдсан — шинэ анги нэмэгдээгүй. "
+                    f"Киноны нэр: {titles}"
+                )
+        elif incomplete:
+            status_line = (
+                f"⚠️ *Бүрэн биш:* зөвхөн {len(db_have)}/{official_total} анги нь "
+                f"бүрэн орсон ({inserted} анги энэ удаа оруулав) — "
+                f"үлдсэн {official_total - len(db_have)} ангийг нөхөхөд "
+                f"цувралын дурын видеог дахин илгээнэ үү."
+            )
         else:
             status_line = f"✅ *Амжилттай орууллаа!* Киноны нэр: {titles}, Нийт оруулав: {inserted} анги."
 
@@ -2261,34 +2271,23 @@ def main() -> None:
     # request`.  Instead of crashing, the bot waits with an escalating
     # backoff (60s → 300s) until the old instance has released the polling
     # lock.  `drop_pending_updates` skips stale updates queued while down.
-    def _poll() -> None:
-        backoff = 60
-        while True:
-            try:
-                app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-                break  # graceful shutdown (KeyboardInterrupt / /stop)
-            except Conflict as e:
-                log.warning(
-                    "Telegram Conflict (another instance polling) — retrying in %ds: %s",
-                    backoff, e,
-                )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-
-    # On Render the health server owns the MAIN thread (answering startup
-    # probes instantly) while the bot polls in the background — a busy bot
-    # can never delay the port's 200 OK and the service never times out.
-    # Locally (no health server) polling keeps the main thread as before.
-    if _HEALTH_SERVER is not None:
-        threading.Thread(target=_poll, daemon=True, name="telegram-poll").start()
-        log.info("Polling in background thread; health server serving on :%s",
-                 _HEALTH_SERVER.server_address[1])
+    #
+    # IMPORTANT: polling MUST run on the MAIN thread — an asyncio loop in a
+    # background thread crashes with `RuntimeError: set_wakeup_fd only works
+    # in main thread` on Python 3.12.  The Render health server already runs
+    # in its own daemon thread (see start_health_server above).
+    backoff = 60
+    while True:
         try:
-            _HEALTH_SERVER.serve_forever()
-        except KeyboardInterrupt:
-            pass
-    else:
-        _poll()
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            break  # graceful shutdown (KeyboardInterrupt / /stop)
+        except Conflict as e:
+            log.warning(
+                "Telegram Conflict (another instance polling) — retrying in %ds: %s",
+                backoff, e,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
 
 if __name__ == "__main__":
