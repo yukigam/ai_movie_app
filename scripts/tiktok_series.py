@@ -50,7 +50,7 @@ REHYDRATION_RE = re.compile(
     re.S,
 )
 _USERNAME_RE = re.compile(r"tiktok\.com/@([\w.-]+)")
-MAX_ACCOUNT_VIDEOS = 200  # hard cap — accounts rarely exceed this
+MAX_ACCOUNT_VIDEOS = 400  # hard cap — distributor accounts exceed 200
 
 
 def _cookie_candidates() -> list[str]:
@@ -224,18 +224,18 @@ def _drama_matches(scope: dict, drama_id: str | None) -> dict | None:
 
 
 def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=None):
-    """Walk the account's video pages over ONE persistent HTTP session
-    (sequential, gently paced) and keep ONLY the videos that belong to the
-    requested drama (by ``dramaID``), ordered by their official episode
-    number.
+    """Walk the account's video pages over ONE persistent HTTP session and
+    keep ONLY the videos that belong to the requested drama (by ``dramaID``),
+    ordered by their official episode number.
 
-    Distributor accounts publish several shows interleaved; the per-video
-    page is the only HTTP-level source of the ``dramaID`` membership.  A
-    hard parallel burst makes TikTok flip every page to the thin login
-    shell, so the walk is sequential with a short random pace and reuses a
-    keep-alive session.  Bound: stops as soon as *expected* episodes are
-    collected.  Thin shells are retried once — the caller's completeness
-    gate reports any shortfall."""
+    Covers multi-PAGE (tabbed) dramas — TikTok splits long series into
+    episode groups ("1-24", "25-48", ...) in the sidebar — because the
+    per-video ``dramaInfo`` block carries the dramaID and official
+    EpisodeNumber regardless of which tab a video belongs to.  The walk is
+    sequential (a hard parallel burst makes TikTok flip every page to the
+    thin login shell) with two rounds: a first pass at modest pace, then a
+    quieter retry pass over only the pages that came back thin/errored.
+    Stops as soon as *expected* episodes are collected."""
     import time as _time
     import random as _rand
 
@@ -262,55 +262,73 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
     if cookie:
         headers["Cookie"] = cookie
 
-    found: list[dict] = []
-    with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
-        for vid in vids:
-            if len(found) >= expected:
-                break
-            _time.sleep(_rand.uniform(0.8, 1.4))
-            url = "https://www.tiktok.com/@{0}/video/{1}".format(username, vid)
-            scope = None
-            for _attempt in range(3):
-                try:
-                    resp = cli.get(url)
-                    resp.raise_for_status()
-                    html = resp.text
-                except Exception as e:
-                    log.warning("Selection fetch failed for %s: %s", url, str(e)[:120])
-                    _time.sleep(2.0)
-                    continue
-                if len(html) >= 50000:
-                    mm = REHYDRATION_RE.search(html)
-                    if mm:
-                        try:
-                            data = json.loads(mm.group(1))
-                            scope = (data or {}).get("__DEFAULT_SCOPE__") or {}
-                        except Exception:
-                            scope = None
-                    break
-                _time.sleep(2.0)  # thin shell — one quiet retry
-            if not scope:
-                continue
-            di = _drama_matches(scope, drama_id)
-            if not di:
-                continue
+    def probe(cli, vid) -> dict | None:
+        """Fetch one video page: returns the scope dict or None."""
+        url = "https://www.tiktok.com/@{0}/video/{1}".format(username, vid)
+        for _attempt in range(3):
             try:
-                ep = int(((di.get("DramaVideoData") or {}).get("EpisodeNumber")) or 0)
-            except (TypeError, ValueError):
-                ep = 0
-            if not ep:
-                ep = len(found) + 1  # official number unknown — assign position
-            found.append({"episode": ep,
-                          "url": "https://www.tiktok.com/@{0}/video/{1}".format(
-                              username, vid)})
-            if progress_cb:
-                try:
-                    progress_cb("Энэ цувралын ангиудыг харуулж байна: {0}/{1}...".format(
-                        len(found), expected))
-                except Exception:
-                    pass
-    found.sort(key=lambda x: x["episode"])
-    return found
+                resp = cli.get(url)
+                resp.raise_for_status()
+                html = resp.text
+            except Exception as e:
+                log.warning("Selection fetch failed for %s: %s", url, str(e)[:120])
+                _time.sleep(2.0)
+                continue
+            if len(html) >= 50000:
+                mm = REHYDRATION_RE.search(html)
+                if mm:
+                    try:
+                        data = json.loads(mm.group(1))
+                        return (data or {}).get("__DEFAULT_SCOPE__") or {}
+                    except Exception:
+                        return None
+                return None
+            _time.sleep(2.0)  # thin shell — quiet retry
+        return None
+
+    def match_ep(scope) -> int | None:
+        di = _drama_matches(scope, drama_id)
+        if not di:
+            return None
+        try:
+            ep = int(((di.get("DramaVideoData") or {}).get("EpisodeNumber")) or 0)
+        except (TypeError, ValueError):
+            ep = 0
+        return ep or None  # None → caller assigns position
+
+    found: list[dict] = []
+    pending = list(vids)
+    round_no = 0
+    wall_start = _time.time()
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
+        while pending and len(found) < expected and _time.time() - wall_start < 420:
+            round_no += 1
+            scale = 1.0 if round_no == 1 else 2.5  # quieter second round
+            missed: list[str] = []
+            for i, vid in enumerate(pending):
+                if len(found) >= expected or _time.time() - wall_start >= 420:
+                    break
+                _time.sleep(_rand.uniform(0.8, 1.4) * scale)
+                scope = probe(cli, vid)
+                if not scope:
+                    missed.append(vid)
+                    continue
+                ep = match_ep(scope)
+                if ep is None:
+                    continue
+                found.append({"episode": ep,
+                              "url": "https://www.tiktok.com/@{0}/video/{1}".format(
+                                  username, vid)})
+                if progress_cb:
+                    try:
+                        progress_cb("Энэ цувралын ангиудыг цуглуулж байна: "
+                                    "{0}/{1}...".format(len(found), expected))
+                    except Exception:
+                        pass
+            if round_no == 1:
+                pending = missed[:120]  # second round capped
+            else:
+                pending = []
 
 
 def _profile_entries(username: str, sec_uid: str | None = None) -> list[dict] | None:
