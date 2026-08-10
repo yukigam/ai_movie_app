@@ -294,19 +294,21 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
             ep = int(((di.get("DramaVideoData") or {}).get("EpisodeNumber")) or 0)
         except (TypeError, ValueError):
             ep = 0
-        return ep or None  # None → caller assigns position
+        if ep < 1 or ep > expected:
+            return None  # official numbers are 1..N — never import beyond the drama total
+        return ep
 
-    found: list[dict] = []
+    by_num: dict[int, str] = {}
     pending = list(vids)
     round_no = 0
     wall_start = _time.time()
     with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
-        while pending and len(found) < expected and _time.time() - wall_start < 420:
+        while pending and len(by_num) < expected and _time.time() - wall_start < 420:
             round_no += 1
             scale = 1.0 if round_no == 1 else 2.5  # quieter second round
             missed: list[str] = []
-            for i, vid in enumerate(pending):
-                if len(found) >= expected or _time.time() - wall_start >= 420:
+            for vid in pending:
+                if len(by_num) >= expected or _time.time() - wall_start >= 420:
                     break
                 _time.sleep(_rand.uniform(0.8, 1.4) * scale)
                 scope = probe(cli, vid)
@@ -314,21 +316,25 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
                     missed.append(vid)
                     continue
                 ep = match_ep(scope)
-                if ep is None:
+                if ep is None or ep in by_num:
                     continue
-                found.append({"episode": ep,
-                              "url": "https://www.tiktok.com/@{0}/video/{1}".format(
-                                  username, vid)})
+                by_num[ep] = vid
                 if progress_cb:
                     try:
                         progress_cb("Энэ цувралын ангиудыг цуглуулж байна: "
-                                    "{0}/{1}...".format(len(found), expected))
+                                    "{0}/{1}...".format(len(by_num), expected))
                     except Exception:
                         pass
             if round_no == 1:
                 pending = missed[:120]  # second round capped
             else:
                 pending = []
+
+    found = [{
+        "episode": num,
+        "url": "https://www.tiktok.com/@{0}/video/{1}".format(username, vid),
+    } for num, vid in sorted(by_num.items())]
+    return found
 
 
 def _profile_entries(username: str, sec_uid: str | None = None) -> list[dict] | None:
@@ -426,19 +432,24 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
             prog(f"Хэрэглэгчээс {len(entries)} анги олдлоо")
             drama_id = meta.get("drama_id")
             expected = meta.get("expected") or 0
-            # Distributor accounts publish several shows interleaved — the
-            # per-video walk (HTML dramaID check) is only triggered when the
-            # account list is clearly bigger than THIS drama's count.  For a
-            # normal single-series account the list itself IS the series.
-            if drama_id and expected and len(entries) > expected * 2:
+            if drama_id and expected:
+                # Official dramaID known — ONLY the aligned videos are
+                # imported: walk the account pages and stop as soon as the
+                # official total (e.g. 50) has been collected.  The account
+                # may hold 200-300 unrelated videos; none of them leak in.
                 selected = _select_drama_episodes(
                     entries, username, drama_id, expected, progress_cb)
                 if selected:
                     episodes = selected
                     prog(f"Энэ цувралтай {len(selected)}/{expected} анги таарлаа")
-            if not episodes:
-                # No drama signal (regular playlist/account, or thin
-                # pages) — the whole account list in release order.
+                else:
+                    # No video of this drama lives on the account — do NOT
+                    # import the unrelated account list.
+                    prog("⚠️ Энэ киноны ангиуд энэ хэрэглэгчээс олдсонгүй "
+                         "(rядах хамааралгүй видео импортлахгүй).")
+            elif entries:
+                # No drama signal at all (regular playlist/account) — the
+                # whole account list in release order is the series.
                 for i, e in enumerate(entries, 1):
                     vid = str(e.get("id") or e.get("url") or "")
                     if not vid:
