@@ -426,27 +426,30 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
 
     episodes: list[dict] = []
     if username:
-        prog(f"@{username} — 60 анги хайж байна (yt-dlp)…")
+        prog(f"@{username} — ангиудыг цуглуулж байна…")
         entries = _profile_entries(username, meta.get("sec_uid"))
         if entries:
-            prog(f"Хэрэглэгчээс {len(entries)} анги олдлоо")
             drama_id = meta.get("drama_id")
             expected = meta.get("expected") or 0
             if drama_id and expected:
-                # Official dramaID known — ONLY the aligned videos are
-                # imported: walk the account pages and stop as soon as the
-                # official total (e.g. 50) has been collected.  The account
-                # may hold 200-300 unrelated videos; none of them leak in.
+                # Official dramaID + official total known — ONLY aligned
+                # videos are imported: walk the account pages and HARD-STOP
+                # the moment the official total (e.g. 50) is collected.
+                # The account may hold 200-300 unrelated videos, and
+                # episodes numbered above the official total are rejected —
+                # none of that junk ever reaches the import list.
+                prog(f"Цувралын албан ёсны ангийн тоо: {expected} — "
+                     f"илүүг татахгүй, шүүж эхэлж байна…")
                 selected = _select_drama_episodes(
                     entries, username, drama_id, expected, progress_cb)
                 if selected:
-                    episodes = selected
-                    prog(f"Энэ цувралтай {len(selected)}/{expected} анги таарлаа")
+                    episodes = selected[:expected]  # hard stop at the official total
+                    prog(f"Энэ цувралтай {len(episodes)}/{expected} анги таарлаа")
                 else:
                     # No video of this drama lives on the account — do NOT
                     # import the unrelated account list.
                     prog("⚠️ Энэ киноны ангиуд энэ хэрэглэгчээс олдсонгүй "
-                         "(rядах хамааралгүй видео импортлахгүй).")
+                         "(хамааралгүй видео импортлогдохгүй).")
             elif entries:
                 # No drama signal at all (regular playlist/account) — the
                 # whole account list in release order is the series.
