@@ -54,11 +54,23 @@ log = logging.getLogger("ttbot")
 # ── Render keep-alive HTTP server (deployment only, no bot logic) ────────────
 # Render kills a Web Service if its port stays silent, and a polling bot never
 # accepts connections.  This minimal built-in server answers 200 OK on the
-# Render-provided PORT from a daemon thread in the background.  It starts ONLY
-# when this file is run as a script (python scripts/telegram_bot.py); module
-# imports (test_pipeline, tiktok_webhook, clean_and_redownload) are unaffected.
+# Render-provided PORT.  It starts ONLY when this file is run as a script
+# (python scripts/telegram_bot.py); module imports (test_pipeline,
+# tiktok_webhook, clean_and_redownload) are unaffected.  On Render the HTTP
+# server runs in the MAIN thread (`serve_forever`) and the bot polls from a
+# daemon thread — Render's startup/health probes are answered immediately and
+# can never be starved by the bot's work, so the instance never times out.
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802  (stdlib naming)
+        self._answer()
+
+    def do_HEAD(self) -> None:  # noqa: N802  (probes also use HEAD)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+
+    def _answer(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", "2")
@@ -69,18 +81,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_health_server() -> None:
-    """Start the Render keep-alive HTTP server on $PORT in a daemon thread."""
-    port = int(os.environ.get("PORT", "8000"))
+_HEALTH_SERVER: HTTPServer | None = None
+
+
+def start_health_server() -> HTTPServer | None:
+    """Bind the Render keep-alive HTTP server on 0.0.0.0:$PORT (default
+    10000 — Render's convention).  Returns the server object so main() can
+    `serve_forever()` on it; the first call wins, later calls are no-ops."""
+    global _HEALTH_SERVER
+    if _HEALTH_SERVER is not None:
+        return _HEALTH_SERVER
+    port = int(os.environ.get("PORT", "10000"))
     try:
-        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        _HEALTH_SERVER = HTTPServer(("0.0.0.0", port), _HealthHandler)
     except Exception as e:
         log.warning("! Health server on port %s failed to start: %s", port, e)
-        return
-    threading.Thread(
-        target=server.serve_forever, daemon=True, name="render-health"
-    ).start()
-    log.info("✓ Render health server listening on 0.0.0.0:%s", port)
+        return None
+    log.info("✓ Render health server bound on 0.0.0.0:%s", port)
+    return _HEALTH_SERVER
 
 
 if __name__ == "__main__":
@@ -2113,18 +2131,34 @@ def main() -> None:
     # request`.  Instead of crashing, the bot waits with an escalating
     # backoff (60s → 300s) until the old instance has released the polling
     # lock.  `drop_pending_updates` skips stale updates queued while down.
-    backoff = 60
-    while True:
+    def _poll() -> None:
+        backoff = 60
+        while True:
+            try:
+                app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+                break  # graceful shutdown (KeyboardInterrupt / /stop)
+            except Conflict as e:
+                log.warning(
+                    "Telegram Conflict (another instance polling) — retrying in %ds: %s",
+                    backoff, e,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+
+    # On Render the health server owns the MAIN thread (answering startup
+    # probes instantly) while the bot polls in the background — a busy bot
+    # can never delay the port's 200 OK and the service never times out.
+    # Locally (no health server) polling keeps the main thread as before.
+    if _HEALTH_SERVER is not None:
+        threading.Thread(target=_poll, daemon=True, name="telegram-poll").start()
+        log.info("Polling in background thread; health server serving on :%s",
+                 _HEALTH_SERVER.server_address[1])
         try:
-            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-            break  # graceful shutdown (KeyboardInterrupt / /stop)
-        except Conflict as e:
-            log.warning(
-                "Telegram Conflict (another instance polling) — retrying in %ds: %s",
-                backoff, e,
-            )
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 300)
+            _HEALTH_SERVER.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    else:
+        _poll()
 
 
 if __name__ == "__main__":
