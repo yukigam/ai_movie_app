@@ -1691,8 +1691,83 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     # been uploaded to Supabase.
     await _insert(msg, videos, force, official_total=last_ep_num)
 
+    # ── Top-up loop (DB об the OFFICIAL total): the conversation NEVER ends
+    #    while the database holds fewer than N healthy episodes (e.g. only 2
+    #    of 50).  Each round re-extracts the series and imports exactly the
+    #    still-missing numbers (3..50); rounds are spaced out so a rate-
+    #    limited TikTok window does not block the walk forever.
+    if last_ep_num and series_title:
+        skey = slug_id(series_title)
+        seed = last_ep_url or (episodes[0]["url"] if episodes else None)
+        store = Store()
+        topup_rounds = 3
+        for rnd in range(1, topup_rounds + 1):
+            have = _healthy_db_episodes(store, skey, last_ep_num)
+            missing = sorted({n for n in range(1, last_ep_num + 1)} - have)
+            if not missing or not seed:
+                break
+            missing_str = ", ".join(f"EP {n}" for n in missing[:8])
+            if len(missing) > 8:
+                missing_str += "…"
+            await _safe_edit(
+                msg,
+                f"🔄 Дутуу {len(missing)} анги илэрлээ ({missing_str}) — "
+                f"татаж нэмж байна ({rnd}/{topup_rounds})…",
+            )
+            imported_any = False
+            try:
+                fresh = await asyncio.wait_for(
+                    asyncio.to_thread(_extract_episodes, seed),
+                    timeout=600,
+                )
+                if fresh and fresh[0].get("_meta"):
+                    fresh.pop(0)
+                fresh_vids: list[dict] = []
+                already = _healthy_db_episodes(store, skey, last_ep_num)
+                for e in fresh:
+                    n = int(e.get("episode") or 0)
+                    if 0 < n <= last_ep_num and n in missing and n not in already:
+                        fresh_vids.append({
+                            "title": f"{series_title} EP.{n}",
+                            "video_url": e["url"],
+                            "_page_url": e["url"],
+                            "_ep": n,
+                            "description": "",
+                            "thumbnail": "",
+                            "duration": 1,
+                        })
+                if fresh_vids:
+                    await _insert(msg, fresh_vids, force, official_total=last_ep_num)
+                    imported_any = True
+            except Exception as e:
+                log.warning("Top-up round %d failed: %s", rnd, clean_error(e))
+            if not imported_any:
+                # extraction still short — let a rate-limit window pass quietly
+                await asyncio.sleep(12)
+
 
 # ── Insertion ───────────────────────────────────────────────────────────────
+
+def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
+    """Distinct episode numbers 1..limit that are FULLY playable in the DB
+    (real video_url, not pending, storage object healthy).  This is the
+    single source of truth for the "гүйцсэн үү?" check — never a guess."""
+    have: set[int] = set()
+    try:
+        for row in store.get_series_episodes(skey):
+            ep = int(row.get("episode_number") or 0)
+            if not ep or (limit and ep > limit):
+                continue
+            if not str(row.get("video_url") or ""):
+                continue
+            if store.has_status and str(row.get("status") or "") == "pending":
+                continue
+            if store.is_episode_video_broken(skey, ep):
+                continue
+            have.add(ep)
+    except Exception as e:
+        log.warning("Healthy-episode query for %s failed: %s", skey, clean_error(e))
+    return have
 
 def _log_memory(tag: str) -> None:
     """Log the process RSS so RAM growth is visible in Render logs.
@@ -2064,21 +2139,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     db_total_known = bool(official_total) and len(groups) == 1
     if db_total_known:
         (skey, _), = groups.items()
-        try:
-            for row in store.get_series_episodes(skey):
-                ep = int(row.get("episode_number") or 0)
-                if not ep or ep > official_total:
-                    continue
-                vid = str(row.get("video_url") or "")
-                if not vid:
-                    continue
-                if store.has_status and str(row.get("status") or "") == "pending":
-                    continue
-                if store.is_episode_video_broken(skey, ep):
-                    continue
-                db_have.add(ep)
-        except Exception as e:
-            log.warning("DB completeness check failed: %s", clean_error(e))
+        db_have = _healthy_db_episodes(store, skey, official_total)
         log.info("DB completeness for %s: %d/%d official episodes healthy",
                  skey, len(db_have), official_total)
 
