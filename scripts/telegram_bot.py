@@ -1639,6 +1639,39 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
                 "duration": 1,
             })
 
+    # ── Completeness gate + auto-refill: if the extraction came back short
+    #    of the official total (e.g. only 2 of 50), re-extract the series
+    #    ONCE and merge the missing episode numbers in — the import below
+    #    then fills 3..N in the same run and the bot can never report
+    #    "everything already present" while the series is incomplete.
+    if last_ep_num and len(episodes) < last_ep_num:
+        seed = last_ep_url or (episodes[0]["url"] if episodes else None)
+        if seed:
+            await _safe_edit(
+                msg,
+                f"⚠️ Зөвхөн {len(episodes)}/{last_ep_num} анги гарлаа — "
+                f"бүрэн жагсаалтыг дахин татаж байна…",
+            )
+            try:
+                full = await asyncio.wait_for(
+                    asyncio.to_thread(_extract_episodes, seed),
+                    timeout=600,
+                )
+                if full and full[0].get("_meta"):
+                    full.pop(0)
+                merged: dict[int, dict] = {
+                    int(e["episode"]): e for e in episodes
+                    if 0 < int(e.get("episode") or 0) <= last_ep_num
+                }
+                for e in full:
+                    num = int(e.get("episode") or 0)
+                    if 0 < num <= last_ep_num:
+                        merged[num] = e
+                episodes = [merged[n] for n in sorted(merged)]
+                log.info("Completeness refill: %d episodes after re-extraction", len(episodes))
+            except Exception as e:
+                log.warning("Completeness re-extraction failed: %s", clean_error(e))
+
     if not videos:
         await _safe_edit(msg, "❌ Could not extract any video sources from any of the %d episodes." % total)
         return
@@ -1656,7 +1689,7 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     )
     # "Import complete" is only sent by _insert() after every episode has
     # been uploaded to Supabase.
-    await _insert(msg, videos, force)
+    await _insert(msg, videos, force, official_total=last_ep_num)
 
 
 # ── Insertion ───────────────────────────────────────────────────────────────
@@ -1676,7 +1709,8 @@ def _log_memory(tag: str) -> None:
     except Exception:
         pass
 
-async def _insert(msg, videos: list[dict], force: bool = False) -> None:
+async def _insert(msg, videos: list[dict], force: bool = False,
+                  official_total: int | None = None) -> None:
     store = Store()
     groups: dict[str, list[dict]] = {}
     for v in videos:
@@ -2021,6 +2055,33 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
         cleanup_left = pending_sources
 
     final_failures = failed + broken_eps + cleanup_left
+
+    # ── Completeness gate vs the OFFICIAL total: "Бүх анги аль хэдийн
+    #    оруулсан" may only be claimed when the database actually holds a
+    #    healthy row for EVERY episode 1..N (e.g. all 50).  With only 2 of
+    #    50 present the import is reported as partial — never as complete.
+    db_have: set[int] = set()
+    db_total_known = bool(official_total) and len(groups) == 1
+    if db_total_known:
+        (skey, _), = groups.items()
+        try:
+            for row in store.get_series_episodes(skey):
+                ep = int(row.get("episode_number") or 0)
+                if not ep or ep > official_total:
+                    continue
+                vid = str(row.get("video_url") or "")
+                if not vid:
+                    continue
+                if store.has_status and str(row.get("status") or "") == "pending":
+                    continue
+                if store.is_episode_video_broken(skey, ep):
+                    continue
+                db_have.add(ep)
+        except Exception as e:
+            log.warning("DB completeness check failed: %s", clean_error(e))
+        log.info("DB completeness for %s: %d/%d official episodes healthy",
+                 skey, len(db_have), official_total)
+
     fail_eps = ", ".join(f"EP {e[1]}" for e in final_failures[:10])
     titles = ", ".join(touched_titles.values()) or "unknown"
     if final_failures:
@@ -2033,11 +2094,19 @@ async def _insert(msg, videos: list[dict], force: bool = False) -> None:
         )
     else:
         if inserted == 0 and skipped > 0:
-            status_line = (
-                f"ℹ️ *Бүх анги аль хэдийн оруулсан байна* (нийт {skipped} ангийг давхар шалгаж, "
-                f"шинийг нэмэх шаардлагагүй байлаа).\n"
-                f"Киноны нэр: {titles}"
-            )
+            if db_total_known and len(db_have) < official_total:
+                status_line = (
+                    f"⚠️ *Бүрэн биш:* өгөгдлийн санд зөвхөн "
+                    f"{len(db_have)}/{official_total} анги л байна — "
+                    f"үлдсэн {official_total - len(db_have)} ангийг нөхөхөд "
+                    f"цувралын дурын видеог дахин илгээнэ үү."
+                )
+            else:
+                status_line = (
+                    f"ℹ️ *Бүх анги аль хэдийн оруулсан байна* (нийт {skipped} ангийг давхар шалгаж, "
+                    f"шинийг нэмэх шаардлагагүй байлаа).\n"
+                    f"Киноны нэр: {titles}"
+                )
         else:
             status_line = f"✅ *Амжилттай орууллаа!* Киноны нэр: {titles}, Нийт оруулав: {inserted} анги."
 
