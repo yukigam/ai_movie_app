@@ -223,10 +223,126 @@ def _drama_matches(scope: dict, drama_id: str | None) -> dict | None:
     return di
 
 
-def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=None):
+_ITEM_LIST_API = "https://www.tiktok.com/api/creator/item_list/"
+
+
+def _api_item_list(username: str, sec_uid: str,
+                   max_videos: int = MAX_ACCOUNT_VIDEOS) -> list[dict]:
+    """Bulk listing of an account's videos straight from TikTok's
+    ``creator/item_list`` API — ONE request per ~15 videos, the same
+    endpoint yt-dlp uses internally (verifyFp/device_id params; NO
+    X-Bogus signature needed).
+
+    Returns the raw itemStruct dicts: each carries ``id``, ``createTime``
+    and — for short dramas — the SAME ``dramaInfo`` block the per-video
+    pages embed, including the official episode number.  So all ~N episode
+    IDs of a drama arrive in a handful of API calls instead of a 1-by-1
+    page walk that TikTok rate-limits into a crawl (the "only 1/50"
+    failure).  Returns [] when TikTok refuses the raw calls.
+    """
+    import random as _rand
+    import string as _string
+    import time as _time
+
+    query = {
+        "aid": "1988",
+        "app_language": "en",
+        "app_name": "tiktok_web",
+        "browser_language": "en-US",
+        "browser_name": "Mozilla",
+        "browser_online": "true",
+        "browser_platform": "Win32",
+        "browser_version": "5.0 (Windows)",
+        "channel": "tiktok_web",
+        "cookie_enabled": "true",
+        "count": "15",
+        "cursor": "0",
+        "device_id": str(_rand.randint(7250000000000000000, 7325099899999994577)),
+        "device_platform": "web_pc",
+        "focus_state": "true",
+        "from_page": "user",
+        "history_len": "2",
+        "is_fullscreen": "false",
+        "is_page_visible": "true",
+        "language": "en",
+        "os": "windows",
+        "priority_region": "",
+        "referer": "",
+        "region": "US",
+        "screen_height": "1080",
+        "screen_width": "1920",
+        "secUid": sec_uid or "",
+        "type": "1",
+        "tz_name": "UTC",
+        "verifyFp": "verify_" + "".join(_rand.choices(_string.hexdigits, k=7)),
+        "webcast_language": "en",
+    }
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/@{0}".format(username),
+    }
+    cookie = _cookies_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        import httpx
+    except ImportError:
+        return []
+
+    items: list[dict] = []
+    cursor = int(_time.time() * 1e3)
+    try:
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
+            for _page in range(14):  # 15/page → up to 210 videos
+                q = dict(query)
+                q["cursor"] = str(cursor)
+                try:
+                    resp = cli.get(_ITEM_LIST_API, params=q)
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as e:
+                    log.warning("item_list API page %d failed: %s",
+                                _page + 1, str(e)[:100])
+                    break
+                batch = data.get("itemList") or []
+                if not batch:
+                    break
+                items.extend(b for b in batch
+                             if isinstance(b, dict) and b.get("id"))
+                last = batch[-1]
+                if not data.get("hasMorePrevious") or not isinstance(last, dict):
+                    break
+                try:
+                    new_cursor = int(float(last.get("createTime") or 0) * 1e3)
+                except (TypeError, ValueError):
+                    new_cursor = 0
+                if not new_cursor or new_cursor == cursor or new_cursor <= 0:
+                    break
+                cursor = new_cursor
+                if len(items) >= max_videos:
+                    break
+                _time.sleep(_rand.uniform(0.4, 0.9))
+    except Exception as e:
+        log.warning("item_list API failed entirely: %s", str(e)[:100])
+        return []
+    if items:
+        log.info("Bulk item_list API: %d items from @%s", len(items), username)
+    return items
+
+
+def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=None,
+                           sec_uid: str | None = None):
     """Walk the account's video pages over ONE persistent HTTP session and
     keep ONLY the videos that belong to the requested drama (by ``dramaID``),
     ordered by their official episode number.
+
+    FAST PATH FIRST: when the account's secUid is known, the full item
+    list is pulled from the bulk ``creator/item_list`` API (a handful of
+    requests, ``dramaInfo`` included) — the 1-by-1 page walk then covers
+    only videos the API did not resolve.  This fixes the "only 1/50
+    episodes" stall where a rate-limited walk crawls for minutes.
 
     Covers multi-PAGE (tabbed) dramas — TikTok splits long series into
     episode groups ("1-24", "25-48", ...) in the sidebar — because the
@@ -299,7 +415,42 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
         return ep
 
     by_num: dict[int, str] = {}
-    pending = list(vids)
+    api_fetched: set[str] = set()
+    if sec_uid:
+        for item in _api_item_list(username, sec_uid):
+            vid = str(item.get("id") or "")
+            mm = re.search(r"(\d{15,25})", vid)
+            if not mm:
+                continue
+            vid = mm.group(1)
+            api_fetched.add(vid)
+            if len(by_num) >= expected:
+                continue
+            di = item.get("dramaInfo")
+            if not isinstance(di, dict):
+                continue
+            if str(di.get("dramaID") or "") != str(drama_id):
+                continue
+            try:
+                ep = int(((di.get("DramaVideoData") or {}).get("EpisodeNumber")) or 0)
+            except (TypeError, ValueError):
+                ep = 0
+            if 1 <= ep <= expected and ep not in by_num:
+                by_num[ep] = vid
+                if progress_cb:
+                    try:
+                        progress_cb("Энэ цувралын ангиудыг цуглуулж байна: "
+                                    "{0}/{1}...".format(len(by_num), expected))
+                    except Exception:
+                        pass
+        if by_num:
+            log.info("Bulk API resolved %d/%d episodes directly",
+                     len(by_num), expected)
+
+    pending = [v for v in vids if v not in api_fetched]
+    if pending:
+        log.info("Drama walk continues over %d videos not covered by the bulk API",
+                 len(pending))
     round_no = 0
     wall_start = _time.time()
     with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
@@ -374,7 +525,9 @@ def _profile_entries(username: str, sec_uid: str | None = None) -> list[dict] | 
         except Exception as e:
             log.warning("yt-dlp profile fetch failed for %s: %s", target, str(e)[:200])
     if not entries:
-        return None
+        # yt-dlp gave nothing (rate-limited to a thin shell) — never give
+        # up on the account without trying the bulk API once.
+        return _profile_entries_api_only(username, sec_uid)
 
     # Entries come newest-first; episode order must be oldest-first.  When
     # timestamps are present they are authoritative (release order == watch
@@ -385,6 +538,62 @@ def _profile_entries(username: str, sec_uid: str | None = None) -> list[dict] | 
         entries.sort(key=lambda e: e.get("timestamp") or 0)
     else:
         entries.reverse()
+
+    # Under-delivery fallback: when yt-dlp only scratched the surface
+    # (e.g. 1 of 50 videos — the "only 1/50 episodes" symptom), merge the
+    # bulk API's full item list in so the walk/select sees every ID.
+    api_items = _api_item_list(username, sec_uid)
+    if len(api_items) > len(entries):
+        by_id: dict[str, dict] = {}
+        for e in entries:
+            vid = str(e.get("id") or e.get("url") or "")
+            bw = re.search(r"(\d{15,25})", vid)
+            key = bw.group(1) if bw else vid
+            if key:
+                by_id[key] = e
+        added = 0
+        for it in api_items:
+            vid = str(it.get("id") or "")
+            bw = re.search(r"(\d{15,25})", vid)
+            key = bw.group(1) if bw else vid
+            if not key or key in by_id:
+                continue
+            stamp = it.get("createTime") or 0
+            by_id[key] = {
+                "id": key,
+                "url": "https://www.tiktok.com/@{0}/video/{1}".format(username, key),
+                "timestamp": int(float(stamp)) if stamp else 0,
+            }
+            added += 1
+        if added:
+            entries = [by_id[k] for k in by_id]
+            entries.sort(key=lambda e: e.get("timestamp") or 0)
+            log.info("Profile list extended by bulk API: %d extra videos",
+                     added)
+    return entries
+
+
+def _profile_entries_api_only(username: str,
+                              sec_uid: str | None = None) -> list[dict] | None:
+    """yt-dlp-less profile listing (bulk API only) — a last-resort path for
+    when the yt-dlp extractor is blocked entirely."""
+    items = _api_item_list(username, sec_uid or "")
+    if not items:
+        return None
+    entries = []
+    for it in items:
+        vid = str(it.get("id") or "")
+        bw = re.search(r"(\d{15,25})", vid)
+        key = bw.group(1) if bw else vid
+        if not key:
+            continue
+        stamp = it.get("createTime") or 0
+        entries.append({
+            "id": key,
+            "url": "https://www.tiktok.com/@{0}/video/{1}".format(username, key),
+            "timestamp": int(float(stamp)) if stamp else 0,
+        })
+    entries.sort(key=lambda e: e.get("timestamp") or 0)
     return entries
 
 
@@ -441,7 +650,8 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
                 prog(f"Цувралын албан ёсны ангийн тоо: {expected} — "
                      f"илүүг татахгүй, шүүж эхэлж байна…")
                 selected = _select_drama_episodes(
-                    entries, username, drama_id, expected, progress_cb)
+                    entries, username, drama_id, expected, progress_cb,
+                    sec_uid=meta.get("sec_uid"))
                 if selected:
                     episodes = selected[:expected]  # hard stop at the official total
                     prog(f"Энэ цувралтай {len(episodes)}/{expected} анги таарлаа")

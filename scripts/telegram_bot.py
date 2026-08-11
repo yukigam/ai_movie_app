@@ -1142,8 +1142,12 @@ class Store:
 #   • no two imports fight over TikTok rate limits
 #   • at most ONE HTTP import is ever alive → RAM usage stays bounded
 #   • the user sees a deterministic queue position instead of chaos
+# Hard watchdog: a wedged job (network hang, endless retry loop) is
+# cancelled after JOB_ABSOLUTE_TIMEOUT so it can NEVER block the queue
+# forever — the next queued import proceeds automatically.
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 _job_worker_task: asyncio.Task | None = None
+JOB_ABSOLUTE_TIMEOUT = 2400  # 40 min per job — a stuck loop gets reset
 
 
 async def _job_worker() -> None:
@@ -1151,7 +1155,10 @@ async def _job_worker() -> None:
     while True:
         job = await JOB_QUEUE.get()
         try:
-            await job()
+            await asyncio.wait_for(job(), timeout=JOB_ABSOLUTE_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.error("Job exceeded %ds — cancelled; next queued job proceeds",
+                      JOB_ABSOLUTE_TIMEOUT)
         except Exception:
             log.exception("Job worker: job crashed")
         finally:
@@ -1696,10 +1703,21 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
         seed = last_ep_url or (episodes[0]["url"] if episodes else None)
         store = Store()
         topup_waits = [12, 20, 30, 45, 60, 90]
+        topup_deadline = time.monotonic() + 20 * 60  # whole top-up ≤ 20 min
+        stalls = 0
         for rnd in range(1, len(topup_waits) + 1):
             have = _healthy_db_episodes(store, skey, last_ep_num)
             missing = sorted({n for n in range(1, last_ep_num + 1)} - have)
             if not missing or not seed:
+                break
+            if time.monotonic() > topup_deadline:
+                log.warning("Top-up budget exhausted at round %d (DB %d/%d)",
+                            rnd, len(have), last_ep_num)
+                await _safe_edit(
+                    msg,
+                    f"⏸️ Бүрэн биш: {len(have)}/{last_ep_num} — TikTok удаашралтай. "
+                    f"Линкийг дахин илгээвэл үлдсэнийг нөхнө.",
+                )
                 break
             missing_str = ", ".join(f"EP {n}" for n in missing[:8])
             if len(missing) > 8:
@@ -1737,6 +1755,18 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
             except Exception as e:
                 log.warning("Top-up round %d failed: %s", rnd, clean_error(e))
             log.info("Top-up round %d done (imported_any=%s)", rnd, imported_any)
+            if imported_any:
+                stalls = 0
+            else:
+                stalls += 1
+                if stalls >= 2 and rnd < len(topup_waits):
+                    have = _healthy_db_episodes(store, skey, last_ep_num)
+                    await _safe_edit(
+                        msg,
+                        f"⚠️ Бүрэн биш: {len(have)}/{last_ep_num} — TikTok "
+                        f"одоогоор удаан. Линкийг дахин илгээвэл үлдсэнийг нөхнө.",
+                    )
+                    break
             if not imported_any and rnd < len(topup_waits):
                 await asyncio.sleep(topup_waits[rnd - 1])
 
