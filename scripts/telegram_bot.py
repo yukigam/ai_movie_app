@@ -1390,6 +1390,36 @@ async def cmd_force(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 BATCH_LIMIT = 50
 
+# Parallel source-extraction: episodes are fetched FETCH_CONCURRENCY at a
+# time (the same batching the profile import already uses safely) — a
+# 50-episode series no longer runs source extraction one-by-one.
+FETCH_CONCURRENCY = 4
+
+
+async def _fetch_episode_source(url: str) -> dict | None:
+    """Fetch one episode's video source with the standard escalating
+    timeout chain (20s → 40s → 80s → 120s) — safe to run in parallel via
+    asyncio.gather (threads never accumulate video bytes)."""
+    for attempt in range(1, IMMEDIATE_RETRIES + 1):
+        timeout = min(EPISODE_FETCH_TIMEOUT * (2 ** (attempt - 1)), MAX_RETRY_TIMEOUT)
+        try:
+            data = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_video, url),
+                timeout=timeout,
+            )
+            if data and data.get("video_url"):
+                return data
+        except asyncio.TimeoutError:
+            log.warning("Fetch timed out for %s (attempt %d/%d, %.0fs) — re-syncing",
+                        url, attempt, IMMEDIATE_RETRIES, timeout)
+        except Exception as e:
+            log.error("Fetch crashed for %s: %s — skipping to next episode",
+                      url, clean_error(e))
+            return None
+        if attempt < IMMEDIATE_RETRIES:
+            await asyncio.sleep(2)
+    return None
+
 
 async def _profile(username: str, msg, force: bool = False) -> None:
     await _safe_edit(msg, f"⏳ Fetching video list from `@{username}`…", parse_mode="Markdown")
@@ -1491,6 +1521,15 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
         last_ep_num = meta.get("last_ep_num")
         last_ep_url = meta.get("last_ep_url")
         series_cover = meta.get("series_cover") or None
+        # Account identity — lets the top-up loop pull ALL episode IDs
+        # from the bulk item_list API instead of re-extracting the series.
+        topup_username = meta.get("username") or ""
+        topup_sec_uid = meta.get("sec_uid") or ""
+        topup_drama_id = meta.get("drama_id") or ""
+    else:
+        topup_username = ""
+        topup_sec_uid = ""
+        topup_drama_id = ""
     # Never invent a series name — garbage titles fall through to the
     # caption/@author logic inside _insert()
     if not series_title or is_garbage_title(series_title):
@@ -1501,56 +1540,42 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
 
     videos = []
     failed: list[dict] = []
-    for i, ep in enumerate(episodes):
-        ep_url = _clean_url(ep["url"])
-        await _safe_edit(msg, f"⏳ Extracting episode {ep['episode']}/{total}…")
-        # Immediate re-sync: retry right away (escalating timeout) so a
-        # single network hang never drops an episode.
-        data = None
-        for attempt in range(1, IMMEDIATE_RETRIES + 1):
-            timeout = min(EPISODE_FETCH_TIMEOUT * (2 ** (attempt - 1)), MAX_RETRY_TIMEOUT)
-            try:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(_fetch_video, ep_url),
-                    timeout=timeout,
-                )
-                if data and data.get("video_url"):
-                    break
-            except asyncio.TimeoutError:
-                log.warning("EP %s: fetch attempt %d/%d timed out (%.0fs) — re-syncing",
-                            ep['episode'], attempt, IMMEDIATE_RETRIES, timeout)
-            except Exception as e:
-                # Skip-and-log: a single bad episode must never stop the
-                # whole series import — mark it failed and move on.
-                log.error("EP %s: fetch attempt %d/%d crashed: %s — skipping to next episode",
-                          ep['episode'], attempt, IMMEDIATE_RETRIES, clean_error(e))
-                data = None
-                break
-            if attempt < IMMEDIATE_RETRIES:
-                await asyncio.sleep(2)
-        if data and data.get("video_url"):
-            # Real episode number wins — parsed from the video's
-            # description/title text ("Episode 1", "EP1", "Part 3", …).
-            # Falls back to the sidebar position from extraction.
-            parsed = parse_episode_number(data.get("description", ""), data.get("title", ""))
-            data["_ep"] = parsed if parsed is not None else ep["episode"]
-            if series_title:
-                data["title"] = f"{series_title} EP.{data['_ep']}"
-            elif not data.get("title"):
-                data["title"] = f"EP.{data['_ep']}"
-            data["_page_url"] = ep_url
-            # STREAMING, NOT ACCUMULATING: do not keep this episode's raw
-            # video bytes in the list — 40–50 episodes × 30–60 MB would OOM
-            # the container before _insert even runs.  The upload step
-            # re-fetches the CDN URL once at insert time (quick re-download,
-            # bounded RAM).
-            data.pop("_video_bytes", None)
-            videos.append(data)
-            log.info("Extractor OK for EP %s: %s", ep['episode'], ep_url)
-        else:
-            log.error("All download methods FAILED for EP %s: %s", ep['episode'], ep_url)
-            failed.append(ep)
-        await asyncio.sleep(0.5)
+    for batch_start in range(0, total, FETCH_CONCURRENCY):
+        batch = episodes[batch_start:batch_start + FETCH_CONCURRENCY]
+        end = min(batch_start + FETCH_CONCURRENCY, total)
+        await _safe_edit(
+            msg,
+            f"⏳ Extracting episodes {batch_start + 1}–{end}/{total}…",
+        )
+        # Immediate re-sync with escalating per-attempt timeout; runs
+        # FETCH_CONCURRENCY episodes in parallel so a 50-episode series
+        # no longer extracts one-by-one.
+        results = await asyncio.gather(
+            *[_fetch_episode_source(_clean_url(ep["url"])) for ep in batch]
+        )
+        for ep, data in zip(batch, results):
+            if data and data.get("video_url"):
+                # Real episode number wins — parsed from the video's
+                # description/title text ("Episode 1", "EP1", "Part 3", …).
+                # Falls back to the sidebar position from extraction.
+                parsed = parse_episode_number(data.get("description", ""), data.get("title", ""))
+                data["_ep"] = parsed if parsed is not None else ep["episode"]
+                if series_title:
+                    data["title"] = f"{series_title} EP.{data['_ep']}"
+                elif not data.get("title"):
+                    data["title"] = f"EP.{data['_ep']}"
+                data["_page_url"] = _clean_url(ep["url"])
+                # STREAMING, NOT ACCUMULATING: do not keep this episode's raw
+                # video bytes in the list — 40–50 episodes × 30–60 MB would OOM
+                # the container before _insert even runs.  The upload step
+                # re-fetches the CDN URL once at insert time (quick re-download,
+                # bounded RAM).
+                data.pop("_video_bytes", None)
+                videos.append(data)
+                log.info("Extractor OK for EP %s: %s", ep['episode'], ep["url"])
+            else:
+                log.error("All download methods FAILED for EP %s: %s", ep['episode'], ep["url"])
+                failed.append(ep)
 
     # ── Strict retry pass: every failed episode is re-fetched up to
     #    MAX_FETCH_ATTEMPTS times.  Each attempt runs the FULL fallback
@@ -1695,15 +1720,21 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
 
     # ── Top-up loop (DB vs the OFFICIAL total): the conversation NEVER ends
     #    while the database holds fewer than N healthy episodes (e.g. only 2
-    #    of 50).  Each round re-extracts the series and imports exactly the
-    #    still-missing numbers (3..50); waits escalate (12s → 90s) so a
-    #    rate-limited TikTok window does not block the walk forever.
+    #    of 50).  FAST PATH: the bulk item_list API (few requests, cached
+    #    across rounds) numbers every episode at once and the still-missing
+    #    ones are fetched IN PARALLEL and imported immediately.  A full
+    #    re-extraction only happens ONCE as a fallback when the bulk API
+    #    cannot number the episodes.  Rounds are short (5/10/15s) because
+    #    each round is now seconds-fast, and the whole loop is bounded by
+    #    a 10-minute budget + 2-empty-round early exit.
     if last_ep_num and series_title:
         skey = slug_id(series_title)
         seed = last_ep_url or (episodes[0]["url"] if episodes else None)
         store = Store()
-        topup_waits = [12, 20, 30, 45, 60, 90]
-        topup_deadline = time.monotonic() + 20 * 60  # whole top-up ≤ 20 min
+        topup_waits = [5, 10, 15]
+        topup_deadline = time.monotonic() + 10 * 60  # whole top-up ≤ 10 min
+        bulk_map: dict[int, str] | None = None
+        fallback_tried = False
         stalls = 0
         for rnd in range(1, len(topup_waits) + 1):
             have = _healthy_db_episodes(store, skey, last_ep_num)
@@ -1728,32 +1759,95 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
                 f"татаж нэмж байна ({rnd}/{len(topup_waits)})…",
             )
             imported_any = False
-            try:
-                fresh = await asyncio.wait_for(
-                    asyncio.to_thread(_extract_episodes, seed),
-                    timeout=600,
-                )
-                if fresh and fresh[0].get("_meta"):
-                    fresh.pop(0)
-                fresh_vids: list[dict] = []
-                already = _healthy_db_episodes(store, skey, last_ep_num)
-                for e in fresh:
-                    n = int(e.get("episode") or 0)
-                    if 0 < n <= last_ep_num and n in missing and n not in already:
-                        fresh_vids.append({
-                            "title": f"{series_title} EP.{n}",
-                            "video_url": e["url"],
-                            "_page_url": e["url"],
-                            "_ep": n,
-                            "description": "",
-                            "thumbnail": "",
-                            "duration": 1,
-                        })
-                if fresh_vids:
-                    await _insert(msg, fresh_vids, force, official_total=last_ep_num)
-                    imported_any = True
-            except Exception as e:
-                log.warning("Top-up round %d failed: %s", rnd, clean_error(e))
+
+            # ── Fast path: bulk item_list API (one-time, cached) — ALL
+            #    episode IDs + official numbers in a handful of requests,
+            #    then the missing ones are fetched in parallel.
+            if topup_sec_uid:
+                try:
+                    if bulk_map is None:
+                        from tiktok_series import _api_item_list
+                        items = await asyncio.to_thread(
+                            _api_item_list, topup_username, topup_sec_uid)
+                        bulk_map = {}
+                        for it in items:
+                            di = it.get("dramaInfo") or {}
+                            if (topup_drama_id
+                                    and str(di.get("dramaID") or "") != topup_drama_id):
+                                continue
+                            try:
+                                ep = int(((di.get("DramaVideoData") or {})
+                                          .get("EpisodeNumber")) or 0)
+                            except (TypeError, ValueError):
+                                ep = 0
+                            vid = str(it.get("id") or "")
+                            bw = re.search(r"(\d{15,25})", vid)
+                            vid = bw.group(1) if bw else vid
+                            if 1 <= ep <= last_ep_num and vid:
+                                bulk_map.setdefault(ep, vid)
+                        log.info("Bulk top-up map: %d/%d episodes numbered by API",
+                                 len(bulk_map), last_ep_num)
+                    cands = [(n, bulk_map[n]) for n in missing if n in bulk_map]
+                    if cands:
+                        fresh_vids: list[dict] = []
+                        for i in range(0, len(cands), FETCH_CONCURRENCY):
+                            chunk = cands[i:i + FETCH_CONCURRENCY]
+                            results = await asyncio.gather(*[
+                                _fetch_episode_source(
+                                    f"https://www.tiktok.com/@{topup_username}/video/{vid}")
+                                for _, vid in chunk
+                            ])
+                            for (n, _vid), data in zip(chunk, results):
+                                if data and data.get("video_url"):
+                                    page_url = (f"https://www.tiktok.com/"
+                                                f"@{topup_username}/video/{_vid}")
+                                    data["_ep"] = n
+                                    data["title"] = f"{series_title} EP.{n}"
+                                    data["_page_url"] = page_url
+                                    data["description"] = ""
+                                    data.pop("_video_bytes", None)
+                                    fresh_vids.append(data)
+                        if fresh_vids:
+                            await _insert(msg, fresh_vids, force,
+                                          official_total=last_ep_num)
+                            imported_any = True
+                            log.info("Top-up fast path imported %d episodes",
+                                     len(fresh_vids))
+                except Exception as e:
+                    log.warning("Top-up bulk path failed: %s", clean_error(e))
+
+            # ── Fallback: ONE full re-extraction (round 1 only) when the
+            #    bulk API did not number the episodes (non-drama account).
+            if not imported_any and not fallback_tried:
+                fallback_tried = True
+                try:
+                    fresh = await asyncio.wait_for(
+                        asyncio.to_thread(_extract_episodes, seed),
+                        timeout=600,
+                    )
+                    if fresh and fresh[0].get("_meta"):
+                        fresh.pop(0)
+                    fresh_vids = []
+                    already = _healthy_db_episodes(store, skey, last_ep_num)
+                    for e in fresh:
+                        n = int(e.get("episode") or 0)
+                        if 0 < n <= last_ep_num and n in missing and n not in already:
+                            fresh_vids.append({
+                                "title": f"{series_title} EP.{n}",
+                                "video_url": e["url"],
+                                "_page_url": e["url"],
+                                "_ep": n,
+                                "description": "",
+                                "thumbnail": "",
+                                "duration": 1,
+                            })
+                    if fresh_vids:
+                        await _insert(msg, fresh_vids, force,
+                                      official_total=last_ep_num)
+                        imported_any = True
+                except Exception as e:
+                    log.warning("Top-up fallback re-extraction failed: %s",
+                                clean_error(e))
             log.info("Top-up round %d done (imported_any=%s)", rnd, imported_any)
             if imported_any:
                 stalls = 0

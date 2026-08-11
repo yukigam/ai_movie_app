@@ -692,6 +692,14 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
         meta_out["series_title"] = meta["series_title"]
     if meta.get("series_cover"):
         meta_out["series_cover"] = meta["series_cover"]
+    # Account identity is carried too — the bot's top-up loop can then pull
+    # ALL episode IDs from the bulk item_list API WITHOUT re-extracting.
+    if meta.get("username"):
+        meta_out["username"] = meta["username"]
+    if meta.get("sec_uid"):
+        meta_out["sec_uid"] = meta["sec_uid"]
+    if meta.get("drama_id"):
+        meta_out["drama_id"] = meta["drama_id"]
     expected = meta.get("expected") or 0
     if expected:
         meta_out["last_ep_num"] = expected
