@@ -113,6 +113,11 @@ DEFAULT_FREE_FIRST = 2
 # with the next episode.
 EPISODE_FETCH_TIMEOUT = 20.0
 
+# Watchdog: an episode's source fetch that shows NO progress within this
+# many seconds is force-skipped (thread abandoned) and the import moves on.
+# This is what stops a stalled TikTok/ssstik window from hanging the loop.
+FETCH_WATCHDOG = 10.0
+
 # Retry-pass cap: per-episode timeout escalates 20s → 40s → 80s → 120s and
 # then stays at this value until the episode downloads successfully.
 MAX_RETRY_TIMEOUT = 120.0
@@ -692,6 +697,9 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
       1. yt-dlp (with cookies) — downloads actual bytes, most reliable  
       2. ssstik.io — free downloader
       3. TikWM API — free API
+      4. DIRECT: the video page's own playAddr mp4 URL (rehydration JSON) —
+         no third-party processing, works even when every downloader is
+         blocked (watermarked, but always available for public videos)
     
     If *custom_title* is provided it overrides the extracted title.
     Returns a dict with ``_video_bytes`` if the video was actually downloaded.
@@ -716,7 +724,12 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
     if result and result.get("video_url"):
         return result
 
-    # 4. Retry yt-dlp for URL-only fallback (if not tried yet)
+    # 4. Direct public URL: TikTok's own playAddr mp4, no processing.
+    result = _fetch_video_direct(url, custom_title)
+    if result and result.get("video_url"):
+        return result
+
+    # 5. Retry yt-dlp for URL-only fallback (if not tried yet)
     if not has_cookies:
         result = _fetch_video_ytdlp(url, custom_title)
         if result:
@@ -724,6 +737,66 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
 
     log.info("all downloaders failed for %s", url)
     return None
+
+
+_DIRECT_RE = re.compile(
+    r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+    re.S,
+)
+
+
+def _fetch_video_direct(url: str, custom_title: str | None = None) -> dict | None:
+    """DIRECT public-video fallback: read the video page's own rehydration
+    JSON and return the playAddr mp4 CDN URL — zero third-party processing.
+
+    Works for ANY public TikTok video even when ssstik/yt-dlp/TikWM are all
+    blocked or stalled; the mp4 is watermarked but fully playable and the
+    uploader accepts it (browser headers + Referer already in _upload_media).
+    """
+    try:
+        import httpx as _httpx
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.tiktok.com/",
+        }
+        cookie = _load_cookies_header()
+        if cookie:
+            headers["Cookie"] = cookie
+        resp = _httpx.get(_clean_url(url), headers=headers,
+                          follow_redirects=True, timeout=15.0)
+        resp.raise_for_status()
+        m = _DIRECT_RE.search(resp.text)
+        if not m:
+            return None
+        data = json.loads(m.group(1))
+        scope = (data or {}).get("__DEFAULT_SCOPE__") or {}
+        item = (((scope.get("webapp.video-detail") or {}).get("itemInfo") or {})
+                .get("itemStruct")) or {}
+        play = (item.get("video") or {}).get("playAddr") or {}
+        urls = play.get("urlList") or []
+        if not urls or not str(urls[0]).startswith("http"):
+            return None
+        mp4 = str(urls[0])
+        desc = str(item.get("desc") or "")
+        title = custom_title or (desc.split("\n")[0][:100] if desc else "TikTok Video")
+        log.info("Direct playAddr fallback OK: %s", mp4[-60:])
+        return {
+            "video_url": mp4,
+            "title": title,
+            "description": desc,
+            "thumbnail": "",
+            "duration": 1,
+        }
+    except Exception as e:
+        log.warning("Direct playAddr fetch failed for %s: %s", url, str(e)[:100])
+        return None
 
 
 def _fetch_entries_ytdlp(username: str) -> list[dict] | None:
@@ -1396,29 +1469,26 @@ BATCH_LIMIT = 50
 FETCH_CONCURRENCY = 4
 
 
-async def _fetch_episode_source(url: str) -> dict | None:
-    """Fetch one episode's video source with the standard escalating
-    timeout chain (20s → 40s → 80s → 120s) — safe to run in parallel via
-    asyncio.gather (threads never accumulate video bytes)."""
-    for attempt in range(1, IMMEDIATE_RETRIES + 1):
-        timeout = min(EPISODE_FETCH_TIMEOUT * (2 ** (attempt - 1)), MAX_RETRY_TIMEOUT)
-        try:
-            data = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_video, url),
-                timeout=timeout,
-            )
-            if data and data.get("video_url"):
-                return data
-        except asyncio.TimeoutError:
-            log.warning("Fetch timed out for %s (attempt %d/%d, %.0fs) — re-syncing",
-                        url, attempt, IMMEDIATE_RETRIES, timeout)
-        except Exception as e:
-            log.error("Fetch crashed for %s: %s — skipping to next episode",
-                      url, clean_error(e))
-            return None
-        if attempt < IMMEDIATE_RETRIES:
-            await asyncio.sleep(2)
-    return None
+async def _fetch_episode_source(url: str, custom_title: str | None = None) -> dict | None:
+    """Watchdog-guarded source fetch for one episode.
+
+    If the fetch shows no progress within FETCH_WATCHDOG seconds, the
+    episode is force-skipped and the import moves on to the next one —
+    a stalled TikTok/ssstik/yt-dlp call can never hang the loop again.
+    Safe to run in parallel via asyncio.gather (no video bytes kept)."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_fetch_video, url, custom_title),
+            timeout=FETCH_WATCHDOG,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Watchdog: %s stalled > %.0fs — force-skipping to next episode",
+                    url, FETCH_WATCHDOG)
+        return None
+    except Exception as e:
+        log.error("Fetch crashed for %s: %s — skipping to next episode",
+                  url, clean_error(e))
+        return None
 
 
 async def _profile(username: str, msg, force: bool = False) -> None:
@@ -1509,12 +1579,41 @@ async def _playlist(url: str, msg, force: bool = False) -> None:
     await _playlist_from_episodes(episodes, msg, force=force)
 
 
+# ── Pending-first series import ─────────────────────────────────────────────
+# The foreground flow only REGISTERS the full episode list (status=pending)
+# in the DB and replies "N анги олдлоо" — the heavy download+upload runs in
+# a detached background task, so a 50-episode import never blocks the job
+# queue and the user sees the complete series instantly.
+_BG_TASKS: dict[str, asyncio.Task] = {}
+
+
+def _start_background_import(skey: str, task: asyncio.Task) -> None:
+    """Keep at most ONE detached import per series: re-sending the same
+    link while a background download already runs reuses it instead of
+    doubling the work (and the TikTok rate-limit pressure)."""
+    current = _BG_TASKS.get(skey)
+    if current and not current.done():
+        log.info("Background import for %s already running — reusing it", skey)
+        return
+    _BG_TASKS[skey] = task
+    task.add_done_callback(
+        lambda t: _BG_TASKS.pop(skey, None) if _BG_TASKS.get(skey) is t else None
+    )
+
+
 async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str | None = None, force: bool = False) -> None:
-    """Import extracted episodes via ssstik.io and upload to Supabase."""
+    """FAST foreground flow: parse metadata, register EVERY episode of the
+    series in the DB as PENDING (one bulk upsert — the app shows the full
+    series + all episode numbers right away), tell the user "N анги олдлоо",
+    then hand the heavy work to a detached background task.  Returns within
+    seconds — the queue never waits on uploads again."""
     # Extract metadata from the first entry
     last_ep_num = None
     last_ep_url = None
     series_cover = None
+    topup_username = ""
+    topup_sec_uid = ""
+    topup_drama_id = ""
     if episodes and episodes[0].get("_meta"):
         meta = episodes.pop(0)["_meta"]
         series_title = series_title or meta.get("series_title")
@@ -1526,15 +1625,92 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
         topup_username = meta.get("username") or ""
         topup_sec_uid = meta.get("sec_uid") or ""
         topup_drama_id = meta.get("drama_id") or ""
-    else:
-        topup_username = ""
-        topup_sec_uid = ""
-        topup_drama_id = ""
-    # Never invent a series name — garbage titles fall through to the
-    # caption/@author logic inside _insert()
+    if not episodes:
+        await _safe_edit(msg, "❌ No episodes extracted.")
+        return
+    # Never invent a series name — garbage titles fall back to @author,
+    # or (last resort) the raw title; _insert() re-validates anyway.
     if not series_title or is_garbage_title(series_title):
-        series_title = None
+        if topup_username:
+            series_title = f"@{topup_username}"
+        elif not series_title:
+            series_title = "TikTok Series"
 
+    total = len(episodes)
+    skey = slug_id(series_title)
+    store = Store()
+    store.upsert_series(skey, series_title, DEFAULT_GENRE, series_title,
+                        series_cover or "")
+
+    # ── Phase 1 (instant): the FULL episode list as PENDING rows — all
+    #    episode numbers appear in the DB before any download starts.
+    #    Already-healthy rows are NEVER clobbered (re-sending a finished
+    #    series must not reset its playable videos to pending).
+    rows: list[dict] = []
+    existing: dict[int, dict] = {}
+    try:
+        existing = {
+            int(r.get("episode_number") or 0): r
+            for r in store.get_series_episodes(skey)
+        }
+    except Exception:
+        pass
+    for ep in episodes:
+        try:
+            n = int(ep.get("episode") or 0)
+        except (TypeError, ValueError):
+            continue
+        if n < 1:
+            continue
+        if not force and n in existing:
+            row0 = existing[n]
+            healthy = (str(row0.get("video_url") or "")
+                       and not (store.has_status
+                                and str(row0.get("status") or "") == "pending"))
+            if healthy:
+                continue  # already playable — never clobber
+        src = _clean_url(ep["url"])
+        row = {
+            "id": f"ep-{skey}-{n}",
+            "series_id": skey,
+            "episode_number": n,
+            "title": f"{series_title} EP.{n}",
+            "description": src if not store.has_status else "",
+            "video_url": "",
+            "thumbnail_url": "",
+            "duration": 0,
+            "is_free": n <= DEFAULT_FREE_FIRST,
+        }
+        if store.has_status:
+            row["status"] = "pending"
+            row["source_url"] = src
+        rows.append(row)
+    if rows:
+        store.bulk_upsert_pending(skey, rows)
+    await _safe_edit(msg, f"✅ {total} анги олдлоо — татаж эхэлж байна…")
+    log.info("Pending-first: %d episodes of %s registered instantly",
+             len(rows), series_title)
+
+    # ── Phase 2 (background): download + upload + verify + top-up.
+    task = asyncio.get_running_loop().create_task(
+        _background_series_import(msg, episodes, series_title, last_ep_num,
+                                  last_ep_url, series_cover, force,
+                                  topup_username, topup_sec_uid,
+                                  topup_drama_id))
+    _start_background_import(skey, task)
+
+
+async def _background_series_import(msg, episodes: list[dict], series_title: str,
+                                    last_ep_num: int | None,
+                                    last_ep_url: str | None,
+                                    series_cover: str | None,
+                                    force: bool = False,
+                                    topup_username: str = "",
+                                    topup_sec_uid: str = "",
+                                    topup_drama_id: str = "") -> None:
+    """Detached heavy import: extract every episode's video source
+    (watchdog-guarded), upload to Supabase, verify, and top up anything
+    still missing — runs in the background and never blocks the queue."""
     total = len(episodes)
     await _safe_edit(msg, f"📦 Found {total} episodes in '{series_title or 'unknown series'}'. Extracting video sources…")
 
@@ -2100,9 +2276,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             still: list[tuple] = []
             for fkey, fep, ftitle, fv in failed:
                 try:
-                    data = await asyncio.to_thread(
-                        _fetch_video, fv.get("_page_url") or fv["video_url"], fv.get("title")
-                    )
+                    data = await _fetch_episode_source(
+                        fv.get("_page_url") or fv["video_url"], fv.get("title"))
                     if not data:
                         still.append((fkey, fep, ftitle, fv))
                         continue
@@ -2144,9 +2319,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                 still_broken: list[tuple] = []
                 for bkey, bep, btitle, bv in broken_eps:
                     try:
-                        data = await asyncio.to_thread(
-                            _fetch_video, bv.get("_page_url") or bv["video_url"], bv.get("title")
-                        )
+                        data = await _fetch_episode_source(
+                            bv.get("_page_url") or bv["video_url"], bv.get("title"))
                         if not data:
                             still_broken.append((bkey, bep, btitle, bv))
                             continue
@@ -2221,7 +2395,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                 still_pending: list[tuple] = []
                 for skey, ep, stitle, src, title in pending_sources:
                     try:
-                        data = await asyncio.to_thread(_fetch_video, src, title)
+                        data = await _fetch_episode_source(src, title)
                         if not data or not data.get("video_url"):
                             still_pending.append((skey, ep, stitle, src, title))
                             continue
