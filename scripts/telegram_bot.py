@@ -118,6 +118,11 @@ EPISODE_FETCH_TIMEOUT = 20.0
 # This is what stops a stalled TikTok/ssstik window from hanging the loop.
 FETCH_WATCHDOG = 10.0
 
+# Outer safety nets for DB calls and video uploads (the Supabase client
+# also carries its own 30s timeouts — these are the final line of defense).
+DB_WATCHDOG = 40.0
+UPLOAD_WATCHDOG = 150.0
+
 # Retry-pass cap: per-episode timeout escalates 20s → 40s → 80s → 120s and
 # then stays at this value until the episode downloads successfully.
 MAX_RETRY_TIMEOUT = 120.0
@@ -998,7 +1003,14 @@ class Store:
     def __init__(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY in .env")
-        self.db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Hard timeouts on EVERY Supabase call (PostgREST + storage) — a
+        # wedged DB/storage request can never hang the import loop again.
+        from supabase import ClientOptions
+        options = ClientOptions(
+            postgrest_client_timeout=30,
+            storage_client_timeout=30,
+        )
+        self.db: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
         self._storage_ready = _ensure_videos_bucket(self.db)
         self.has_status = self._probe_status_columns()
 
@@ -1469,6 +1481,42 @@ BATCH_LIMIT = 50
 FETCH_CONCURRENCY = 4
 
 
+async def _db_call(fn, *args, **kwargs):
+    """Run a blocking Supabase call OFF the event loop with a hard
+    watchdog (postgrest_client_timeout covers the HTTP layer too, this
+    is the outer safety net).  Returns None on timeout — the callers'
+    own guards treat it as a failure and move on."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fn, *args, **kwargs),
+            timeout=DB_WATCHDOG,
+        )
+    except asyncio.TimeoutError:
+        log.error("DB call timed out after %.0fs: %s",
+                  DB_WATCHDOG, getattr(fn, "__name__", "store_call"))
+        return None
+    except Exception:
+        raise
+
+
+async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
+                                 preloaded_bytes: bytes | None = None) -> str:
+    """Upload one episode's video with a hard watchdog — a stalled CDN
+    download or storage POST (up to 2 min each inside) can never hang
+    the import again.  Returns the public URL or "" (callers retry/skip)."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(store.upload_video, skey, ep, src_url, preloaded_bytes),
+            timeout=UPLOAD_WATCHDOG,
+        )
+    except asyncio.TimeoutError:
+        log.error("Upload watchdog: EP %s of %s stalled > %.0fs — moving on",
+                  ep, skey, UPLOAD_WATCHDOG)
+        return ""
+    except Exception:
+        raise
+
+
 async def _fetch_episode_source(url: str, custom_title: str | None = None) -> dict | None:
     """Watchdog-guarded source fetch for one episode.
 
@@ -1639,8 +1687,8 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     total = len(episodes)
     skey = slug_id(series_title)
     store = Store()
-    store.upsert_series(skey, series_title, DEFAULT_GENRE, series_title,
-                        series_cover or "")
+    await _db_call(store.upsert_series, skey, series_title, DEFAULT_GENRE,
+                    series_title, series_cover or "")
 
     # ── Phase 1 (instant): the FULL episode list as PENDING rows — all
     #    episode numbers appear in the DB before any download starts.
@@ -1649,9 +1697,10 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     rows: list[dict] = []
     existing: dict[int, dict] = {}
     try:
+        all_rows = await _db_call(store.get_series_episodes, skey) or []
         existing = {
             int(r.get("episode_number") or 0): r
-            for r in store.get_series_episodes(skey)
+            for r in all_rows
         }
     except Exception:
         pass
@@ -1686,7 +1735,7 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
             row["source_url"] = src
         rows.append(row)
     if rows:
-        store.bulk_upsert_pending(skey, rows)
+        await _db_call(store.bulk_upsert_pending, skey, rows)
     await _safe_edit(msg, f"✅ {total} анги олдлоо — татаж эхэлж байна…")
     log.info("Pending-first: %d episodes of %s registered instantly",
              len(rows), series_title)
@@ -1700,6 +1749,83 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     _start_background_import(skey, task)
 
 
+async def _complete_series_pending_rows(skey: str, stitle: str,
+                                        rows: list[dict]) -> None:
+    """Background completion of one series' pending rows (startup sweep).
+    Each pending episode is fetched (watchdog), uploaded (watchdog) and
+    upserted as healthy — never blocks the queue."""
+    store = Store()
+    done = 0
+    for r in rows:
+        try:
+            ep = int(r.get("episode_number") or 0)
+            src = str(r.get("source_url") or "") or str(r.get("description") or "")
+            if not ep or not src.startswith("http"):
+                continue
+            data = await _fetch_episode_source(src, f"{stitle} EP.{ep}")
+            if not data or not data.get("video_url"):
+                continue
+            rvideo = await _upload_video_watchdog(
+                store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
+            data.pop("_video_bytes", None)
+            if not rvideo:
+                continue
+            data["title"] = f"{stitle} EP.{ep}"
+            data["_page_url"] = src
+            data["thumbnail"] = data.get("thumbnail") or ""
+            await _db_call(store.upsert_episode, skey, ep, data,
+                           ep <= DEFAULT_FREE_FIRST)
+            done += 1
+        except Exception as e:
+            log.warning("Startup sweep: EP %s of %s failed: %s",
+                        r.get("episode_number"), stitle, clean_error(e))
+    if done:
+        log.info("Startup sweep: completed %d pending episodes of %s", done, stitle)
+
+
+async def _startup_pending_sweep() -> None:
+    """Self-healing sweep on bot start: every series with pending/incomplete
+    episodes (crash mid-import, Render redeploy) is completed in the
+    background — no import is ever left half-done."""
+    try:
+        await asyncio.sleep(15)  # let polling + first updates settle
+        store = Store()
+        if not store.has_status:
+            log.info("Startup sweep: no status column — skipping")
+            return
+        try:
+            resp = (store.db.table("episodes")
+                    .select("series_id, episode_number, source_url, title, status")
+                    .eq("status", "pending")
+                    .limit(400)
+                    .execute())
+        except Exception as e:
+            log.warning("Startup sweep query failed: %s", clean_error(e))
+            return
+        pending = resp.data if resp else []
+        if not pending:
+            log.info("Startup sweep: no pending episodes")
+            return
+        by_series: dict[str, list[dict]] = {}
+        for r in pending:
+            by_series.setdefault(str(r.get("series_id") or ""), []).append(r)
+        for skey, srows in by_series.items():
+            stitle = skey
+            try:
+                sresp = (store.db.table("series")
+                         .select("id, title").eq("id", skey).execute())
+                if sresp and sresp.data:
+                    stitle = str(sresp.data[0].get("title") or skey)
+            except Exception:
+                pass
+            log.info("Startup sweep: %d pending episodes of %s — completing",
+                     len(srows), stitle)
+            asyncio.get_running_loop().create_task(
+                _complete_series_pending_rows(skey, stitle, srows))
+    except Exception as e:
+        log.warning("Startup sweep crashed: %s", clean_error(e))
+
+
 async def _background_series_import(msg, episodes: list[dict], series_title: str,
                                     last_ep_num: int | None,
                                     last_ep_url: str | None,
@@ -1708,6 +1834,103 @@ async def _background_series_import(msg, episodes: list[dict], series_title: str
                                     topup_username: str = "",
                                     topup_sec_uid: str = "",
                                     topup_drama_id: str = "") -> None:
+    """Crash-proof wrapper around the heavy import: whatever happens to the
+    pipeline (exception, watchdog skip, cancellation), a final completeness
+    sweep ALWAYS runs so the series is never left with gaps."""
+    try:
+        await _background_series_import_impl(
+            msg, episodes, series_title, last_ep_num, last_ep_url,
+            series_cover, force, topup_username, topup_sec_uid,
+            topup_drama_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Background series import crashed for %s — sweeping pending rows",
+                      series_title)
+    finally:
+        if last_ep_num and series_title:
+            try:
+                await _final_sweep_for_series(series_title, last_ep_num)
+            except Exception:
+                log.exception("Final sweep crashed for %s", series_title)
+
+
+async def _final_sweep_for_series(series_title: str, last_ep_num: int) -> None:
+    """100%-completeness self-check: after the import (and even after a
+    crash) every episode 1..N must be healthy in the DB.  Anything still
+    missing is re-imported from its stored source_url (or the bulk API)
+    until complete or the hard budget expires."""
+    store = Store()
+    skey = slug_id(series_title)
+    have = await _healthy_db_episodes(store, skey, last_ep_num)
+    missing = sorted({n for n in range(1, last_ep_num + 1)} - have)
+    if not missing:
+        log.info("Final sweep for %s: already complete (%d/%d)",
+                 series_title, last_ep_num, last_ep_num)
+        return
+    log.info("Final sweep for %s: %d episodes still missing — re-importing",
+             series_title, len(missing))
+
+    # Source map: stored source_url (pending rows) — the source of truth
+    # for every episode this run registered.
+    src_by_ep: dict[int, str] = {}
+    try:
+        rows = await _db_call(store.get_series_episodes, skey) or []
+        for r in rows:
+            ep = int(r.get("episode_number") or 0)
+            if ep not in missing:
+                continue
+            src = str(r.get("source_url") or "") or str(r.get("description") or "")
+            if src and src.startswith("http"):
+                src_by_ep[ep] = src
+    except Exception as e:
+        log.warning("Final sweep source map failed: %s", clean_error(e))
+
+    sweep_deadline = time.monotonic() + 20 * 60
+    while missing and time.monotonic() < sweep_deadline:
+        still_missing: list[int] = []
+        for ep in missing:
+            src = src_by_ep.get(ep)
+            if not src:
+                continue
+            data = await _fetch_episode_source(src, f"{series_title} EP.{ep}")
+            if not data or not data.get("video_url"):
+                still_missing.append(ep)
+                continue
+            rvideo = await _upload_video_watchdog(
+                store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
+            data.pop("_video_bytes", None)
+            if not rvideo:
+                still_missing.append(ep)
+                continue
+            data["title"] = f"{series_title} EP.{ep}"
+            data["_page_url"] = src
+            data["thumbnail"] = data.get("thumbnail") or ""
+            await _db_call(store.upsert_episode, skey, ep, data, ep <= DEFAULT_FREE_FIRST)
+            log.info("Final sweep: EP %s of %s completed", ep, series_title)
+        if still_missing == missing:
+            break  # no progress this round — stop burning requests
+        missing = still_missing
+        if missing:
+            await asyncio.sleep(15)
+
+    have = await _healthy_db_episodes(store, skey, last_ep_num)
+    if len(have) == last_ep_num:
+        log.info("Final sweep for %s: COMPLETE %d/%d", series_title,
+                 last_ep_num, last_ep_num)
+    else:
+        log.warning("Final sweep for %s: still %d/%d (budget/rate-limited)",
+                    series_title, len(have), last_ep_num)
+
+
+async def _background_series_import_impl(msg, episodes: list[dict], series_title: str,
+                                         last_ep_num: int | None,
+                                         last_ep_url: str | None,
+                                         series_cover: str | None,
+                                         force: bool = False,
+                                         topup_username: str = "",
+                                         topup_sec_uid: str = "",
+                                         topup_drama_id: str = "") -> None:
     """Detached heavy import: extract every episode's video source
     (watchdog-guarded), upload to Supabase, verify, and top up anything
     still missing — runs in the background and never blocks the queue."""
@@ -1900,20 +2123,21 @@ async def _background_series_import(msg, episodes: list[dict], series_title: str
     #    across rounds) numbers every episode at once and the still-missing
     #    ones are fetched IN PARALLEL and imported immediately.  A full
     #    re-extraction only happens ONCE as a fallback when the bulk API
-    #    cannot number the episodes.  Rounds are short (5/10/15s) because
-    #    each round is now seconds-fast, and the whole loop is bounded by
-    #    a 10-minute budget + 2-empty-round early exit.
+    #    cannot number the episodes.  Runs detached in the background, so
+    #    rounds are patient (5→30s escalating) and the whole loop is bounded
+    #    by a 30-minute budget + 2-empty-round early exit; the final sweep
+    #    afterwards guarantees zero gaps.
     if last_ep_num and series_title:
         skey = slug_id(series_title)
         seed = last_ep_url or (episodes[0]["url"] if episodes else None)
         store = Store()
-        topup_waits = [5, 10, 15]
-        topup_deadline = time.monotonic() + 10 * 60  # whole top-up ≤ 10 min
+        topup_waits = [5, 10, 15, 20, 30]
+        topup_deadline = time.monotonic() + 30 * 60  # whole top-up ≤ 30 min
         bulk_map: dict[int, str] | None = None
         fallback_tried = False
         stalls = 0
         for rnd in range(1, len(topup_waits) + 1):
-            have = _healthy_db_episodes(store, skey, last_ep_num)
+            have = await _healthy_db_episodes(store, skey, last_ep_num)
             missing = sorted({n for n in range(1, last_ep_num + 1)} - have)
             if not missing or not seed:
                 break
@@ -2004,7 +2228,7 @@ async def _background_series_import(msg, episodes: list[dict], series_title: str
                     if fresh and fresh[0].get("_meta"):
                         fresh.pop(0)
                     fresh_vids = []
-                    already = _healthy_db_episodes(store, skey, last_ep_num)
+                    already = await _healthy_db_episodes(store, skey, last_ep_num)
                     for e in fresh:
                         n = int(e.get("episode") or 0)
                         if 0 < n <= last_ep_num and n in missing and n not in already:
@@ -2030,7 +2254,7 @@ async def _background_series_import(msg, episodes: list[dict], series_title: str
             else:
                 stalls += 1
                 if stalls >= 2 and rnd < len(topup_waits):
-                    have = _healthy_db_episodes(store, skey, last_ep_num)
+                    have = await _healthy_db_episodes(store, skey, last_ep_num)
                     await _safe_edit(
                         msg,
                         f"⚠️ Бүрэн биш: {len(have)}/{last_ep_num} — TikTok "
@@ -2043,13 +2267,17 @@ async def _background_series_import(msg, episodes: list[dict], series_title: str
 
 # ── Insertion ───────────────────────────────────────────────────────────────
 
-def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
+async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
     """Distinct episode numbers 1..limit that are FULLY playable in the DB
     (real video_url, not pending, storage object healthy).  This is the
-    single source of truth for the "гүйцсэн үү?" check — never a guess."""
+    single source of truth for the "гүйцсэн үү?" check — never a guess.
+    Every DB/storage call is watchdog-guarded (never blocks the loop)."""
     have: set[int] = set()
     try:
-        for row in store.get_series_episodes(skey):
+        rows = await _db_call(store.get_series_episodes, skey)
+        if rows is None:
+            return have
+        for row in rows:
             ep = int(row.get("episode_number") or 0)
             if not ep or (limit and ep > limit):
                 continue
@@ -2057,7 +2285,8 @@ def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) ->
                 continue
             if store.has_status and str(row.get("status") or "") == "pending":
                 continue
-            if store.is_episode_video_broken(skey, ep):
+            broken = await _db_call(store.is_episode_video_broken, skey, ep)
+            if broken:
                 continue
             have.add(ep)
     except Exception as e:
@@ -2128,8 +2357,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             ep1 = next((v for v in vlist if v.get("_ep") == 1), None)
             if ep1 and ep1.get("thumbnail"):
                 thumb = ep1["thumbnail"]
-            elif store.episode_exists(skey, 1):
-                thumb = store.get_episode_thumbnail(skey, 1)
+            elif await _db_call(store.episode_exists, skey, 1):
+                thumb = await _db_call(store.get_episode_thumbnail, skey, 1) or ""
             else:
                 thumb = ""
         if not thumb:
@@ -2141,7 +2370,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             f"📦 Series [{idx}/{total_groups}]: *{stitle}*",
             parse_mode="Markdown",
         )
-        store.upsert_series(skey, stitle, DEFAULT_GENRE, desc, thumb)
+        await _db_call(store.upsert_series, skey, stitle, DEFAULT_GENRE, desc, thumb)
         created += 1
 
         # ── Order by the REAL episode number, not the download order ────
@@ -2174,7 +2403,9 @@ async def _insert(msg, videos: list[dict], force: bool = False,
         bulk_rows: list[dict] = []
         for v in ordered:
             ep = v["_ep"]
-            if store.episode_exists(skey, ep) and not store.is_episode_pending(skey, ep) and not store.is_episode_video_broken(skey, ep):
+            if (await _db_call(store.episode_exists, skey, ep)
+                    and not await _db_call(store.is_episode_pending, skey, ep)
+                    and not await _db_call(store.is_episode_video_broken, skey, ep)):
                 continue
             source = v.get("_page_url") or v.get("video_url") or ""
             row = {
@@ -2194,18 +2425,20 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             bulk_rows.append(row)
             pre_registered.add((skey, ep))
         if bulk_rows:
-            store.bulk_upsert_pending(skey, bulk_rows)
+            await _db_call(store.bulk_upsert_pending, skey, bulk_rows)
 
         for v in ordered:
             ep = v["_ep"]
             processed += 1
-            if store.episode_exists(skey, ep):
+            if await _db_call(store.episode_exists, skey, ep):
                 if (skey, ep) in pre_registered:
                     pass  # bulk-registered by this import — just upload it
                 # Skip ONLY healthy existing episodes.  Pending (incomplete/
                 # retrying) and broken (0-byte/expired) episodes are never
                 # treated as duplicates — they are re-downloaded & completed.
-                elif not force and not store.is_episode_pending(skey, ep) and not store.is_episode_video_broken(skey, ep):
+                elif (not force
+                      and not await _db_call(store.is_episode_pending, skey, ep)
+                      and not await _db_call(store.is_episode_video_broken, skey, ep)):
                     skipped += 1
                     continue
                 else:
@@ -2224,10 +2457,10 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             )
             try:
                 preloaded = v.get("_video_bytes") or None
-                video_url = await asyncio.to_thread(store.upload_video, skey, ep, v["video_url"], preloaded)
+                video_url = await _upload_video_watchdog(store, skey, ep, v["video_url"], preloaded)
                 thumb_url = v["thumbnail"]
                 if thumb_url:
-                    thumb_url = await asyncio.to_thread(store.upload_thumbnail, skey, ep, thumb_url)
+                    thumb_url = await _db_call(store.upload_thumbnail, skey, ep, thumb_url)
             except Exception as e:
                 # Skip-and-log: an upload crash must never abort the series —
                 # mark the episode failed and continue with the next one.
@@ -2250,7 +2483,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
 
             v["video_url"] = video_url
             v["thumbnail"] = thumb_url
-            store.upsert_episode(skey, ep, v, ep <= DEFAULT_FREE_FIRST)
+            await _db_call(store.upsert_episode, skey, ep, v, ep <= DEFAULT_FREE_FIRST)
             inserted += 1
             inserted_eps.append((skey, ep, stitle, v))
 
@@ -2281,9 +2514,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                     if not data:
                         still.append((fkey, fep, ftitle, fv))
                         continue
-                    rvideo = await asyncio.to_thread(
-                        store.upload_video, fkey, fep, data["video_url"], data.get("_video_bytes") or None
-                    )
+                    rvideo = await _upload_video_watchdog(
+                        store, fkey, fep, data["video_url"], data.get("_video_bytes") or None)
                     data.pop("_video_bytes", None)
                 except Exception as e:
                     log.error("Retry crashed for EP %s of %s: %s — keeping it for the next round",
@@ -2292,7 +2524,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                     continue
                 if rvideo:
                     fv["video_url"] = rvideo
-                    store.upsert_episode(fkey, fep, fv, fep <= DEFAULT_FREE_FIRST)
+                    await _db_call(store.upsert_episode, fkey, fep, fv, fep <= DEFAULT_FREE_FIRST)
                     inserted += 1
                     inserted_eps.append((fkey, fep, ftitle, fv))
                     log.info("Retry OK for EP %s of %s (round %d)", fep, ftitle, attempt)
@@ -2324,9 +2556,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                         if not data:
                             still_broken.append((bkey, bep, btitle, bv))
                             continue
-                        rvideo = await asyncio.to_thread(
-                            store.upload_video, bkey, bep, data["video_url"], data.get("_video_bytes") or None
-                        )
+                        rvideo = await _upload_video_watchdog(
+                            store, bkey, bep, data["video_url"], data.get("_video_bytes") or None)
                         data.pop("_video_bytes", None)
                     except Exception as e:
                         log.error("Auto-clean crashed for EP %s of %s: %s — keeping it for the next round",
@@ -2335,7 +2566,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                         continue
                     if rvideo:
                         bv["video_url"] = rvideo
-                        store.upsert_episode(bkey, bep, bv, bep <= DEFAULT_FREE_FIRST)
+                        await _db_call(store.upsert_episode, bkey, bep, bv, bep <= DEFAULT_FREE_FIRST)
                         log.info("Auto-clean OK for EP %s of %s (round %d)", bep, btitle, attempt)
                     else:
                         still_broken.append((bkey, bep, btitle, bv))
@@ -2349,7 +2580,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     # URL).  They are NEVER skipped as duplicates on the next import — the
     # cleanup queue below and any future import of this series complete them.
     for fkey, fep, ftitle, fv in failed + broken_eps:
-        store.upsert_episode_pending(fkey, fep, fv)
+        await _db_call(store.upsert_episode_pending, fkey, fep, fv)
         log.warning("EP %s of %s marked PENDING in DB (auto-complete on next import)", fep, ftitle)
 
     # ── Auto cleanup queue: collect EVERY pending/incomplete episode of
@@ -2360,7 +2591,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
         already_done = {(f[0], f[1]) for f in failed + broken_eps + inserted_eps}
         pending_sources: list[tuple] = []
         for skey, stitle in touched_titles.items():
-            for row in store.get_series_episodes(skey):
+            all_rows = await _db_call(store.get_series_episodes, skey) or []
+            for row in all_rows:
                 ep = int(row.get("episode_number") or 0)
                 if not ep or (skey, ep) in already_done:
                     continue
@@ -2399,9 +2631,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                         if not data or not data.get("video_url"):
                             still_pending.append((skey, ep, stitle, src, title))
                             continue
-                        rvideo = await asyncio.to_thread(
-                            store.upload_video, skey, ep, data["video_url"], data.get("_video_bytes") or None
-                        )
+                        rvideo = await _upload_video_watchdog(
+                            store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
                         data.pop("_video_bytes", None)
                     except Exception as e:
                         log.error("Cleanup crashed for EP %s of %s: %s — keeping it for the next round",
@@ -2411,7 +2642,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                     if rvideo:
                         data["_page_url"] = src
                         data["title"] = title
-                        store.upsert_episode(skey, ep, data, ep <= DEFAULT_FREE_FIRST)
+                        await _db_call(store.upsert_episode, skey, ep, data, ep <= DEFAULT_FREE_FIRST)
                         inserted += 1
                         inserted_eps.append((skey, ep, stitle, data))
                         log.info("Auto cleanup OK: EP %s of %s (round %d)", ep, stitle, attempt)
@@ -2432,7 +2663,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     db_total_known = bool(official_total) and len(groups) == 1
     if db_total_known:
         (skey, _), = groups.items()
-        db_have = _healthy_db_episodes(store, skey, official_total)
+        db_have = await _healthy_db_episodes(store, skey, official_total)
         log.info("DB completeness for %s: %d/%d official episodes healthy",
                  skey, len(db_have), official_total)
 
@@ -2530,6 +2761,12 @@ def main() -> None:
             log.info("Stale webhook cleared before polling")
         except Exception as e:
             log.warning("Could not clear webhook before polling: %s", clean_error(e))
+        # Self-healing across restarts: pending episodes left by a crash or
+        # a Render redeploy are re-imported in the background automatically.
+        try:
+            asyncio.get_running_loop().create_task(_startup_pending_sweep())
+        except Exception as e:
+            log.warning("Startup sweep scheduling failed: %s", clean_error(e))
 
     app = (
         Application.builder()
