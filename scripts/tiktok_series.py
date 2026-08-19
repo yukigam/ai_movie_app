@@ -103,6 +103,17 @@ def clean_url(url: str) -> str:
     return url.split("?")[0].rstrip("/")
 
 
+def _rotate_host(url: str) -> str:
+    """Swap www.tiktok.com <-> m.tiktok.com — automatic mirror fallback
+    for DNS / [Errno -2] / getaddrinfo failures on one host."""
+    m = re.search(r"(https?://)([\w.-]*tiktok\.com)", url)
+    if not m:
+        return url
+    host = m.group(2)
+    swap = "m.tiktok.com" if host.startswith("www") else "www.tiktok.com"
+    return url[:m.start(2)] + swap + url[m.end(2):]
+
+
 def _load_page(url: str, timeout: float = 25.0, quick: bool = False) -> dict | None:
     """Fetch a TikTok page over plain HTTP and return the rehydration scope
     dict, or None when the page carries no JSON (thin shell page, network
@@ -123,12 +134,25 @@ def _load_page(url: str, timeout: float = 25.0, quick: bool = False) -> dict | N
     if cookie:
         headers["Cookie"] = cookie
     attempts = 2 if quick else 4
+    mirrored = False
     for attempt in range(attempts):
         try:
             resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=timeout)
             resp.raise_for_status()
             html = resp.text
         except Exception as e:
+            msg = str(e)[:120].lower()
+            # DNS/[Errno -2]/getaddrinfo — rotate to the mirror host once
+            # instead of failing the whole page fetch.
+            if (not mirrored and ("name or service not known" in msg
+                                  or "getaddrinfo" in msg
+                                  or "connection" in msg
+                                  or isinstance(e, (ConnectionError, TimeoutError)))):
+                url = _rotate_host(url)
+                mirrored = True
+                log.warning("Page fetch DNS/conn error — rotating to mirror %s: %s",
+                            url, str(e)[:100])
+                continue
             log.warning("Page fetch failed for %s: %s", url, str(e)[:120])
             return None
         if len(html) >= 50000:
@@ -298,10 +322,12 @@ def _api_item_list(username: str, sec_uid: str,
             for _page in range(14):  # 15/page → up to 210 videos
                 q = dict(query)
                 q["cursor"] = str(cursor)
+                api_url = _ITEM_LIST_API
+                mirrored_api = False
                 page_ok = False
                 for _try in range(3):  # DNS/connection drift -> retry in place
                     try:
-                        resp = cli.get(_ITEM_LIST_API, params=q)
+                        resp = cli.get(api_url, params=q)
                         resp.raise_for_status()
                         data = resp.json()
                         page_ok = True
@@ -313,6 +339,9 @@ def _api_item_list(username: str, sec_uid: str,
                             or "getaddrinfo" in msg.lower()
                             or isinstance(e, (ConnectionError, TimeoutError))
                         ):
+                            if not mirrored_api:
+                                api_url = _rotate_host(api_url)
+                                mirrored_api = True
                             log.warning("item_list API page %d transient error (try %d/3): %s — retrying",
                                         _page + 1, _try + 2, msg)
                             _time.sleep(2.0 * (_try + 1))

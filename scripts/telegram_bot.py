@@ -515,6 +515,23 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
 
 # ── TikTok extraction ───────────────────────────────────────────────────────
 
+# Optional comma-separated ssstik mirror hosts (env SSSTIK_MIRRORS, e.g.
+# "ssstik.io,ssstik.info").  On a DNS/[Errno -2] / connection failure the
+# downloader automatically rotates to the next mirror before giving up.
+SSSTIK_MIRRORS = [
+    h.strip() if "://" in h else f"https://{h.strip()}"
+    for h in os.getenv("SSSTIK_MIRRORS", "").split(",") if h.strip()
+]
+
+
+def _ssstik_hosts() -> list[str]:
+    hosts = [SSSTIK_URL]
+    for base in SSSTIK_MIRRORS:
+        if base not in hosts:
+            hosts.append(base)
+    return hosts
+
+
 def _fetch_video_ssstik(url: str, custom_title: str | None = None) -> dict | None:
     """Extract video via ssstik.io free downloader.
 
@@ -524,78 +541,87 @@ def _fetch_video_ssstik(url: str, custom_title: str | None = None) -> dict | Non
 
     If *custom_title* is provided, it overrides the extracted title.
     """
-    try:
-        s = httpx.Client(follow_redirects=True, timeout=30.0)
-        s.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
+    last_err: Exception | None = None
+    for base in _ssstik_hosts():
+        try:
+            s = httpx.Client(follow_redirects=True, timeout=30.0)
+            s.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            })
 
-        # Step 1 — fetch homepage to get CSRF token
-        r1 = _net_retry(s.get, SSSTIK_URL, label="ssstik-home")
-        m = re.search(r"s_tt = '([^']+)'", r1.text)
-        tt = m.group(1) if m else ""
+            # Step 1 — fetch homepage to get CSRF token
+            r1 = _net_retry(s.get, base, label=f"ssstik-home-{base}")
+            m = re.search(r"s_tt = '([^']+)'", r1.text)
+            tt = m.group(1) if m else ""
 
-        # Step 2 — submit video URL
-        r2 = _net_retry(
-            s.post, f"{SSSTIK_URL}/abc?url=dl",
-            data={"id": url, "locale": "en", "tt": tt},
-            label="ssstik-submit",
-        )
-        body = r2.text
+            # Step 2 — submit video URL
+            r2 = _net_retry(
+                s.post, f"{base}/abc?url=dl",
+                data={"id": url, "locale": "en", "tt": tt},
+                label=f"ssstik-submit-{base}",
+            )
+            body = r2.text
 
-        if "panel critical" in body or "serious problem" in body:
-            log.warning("ssstik.io error for %s (TikTok unavailable or blocked)", url)
+            if "panel critical" in body or "serious problem" in body:
+                log.warning("ssstik.io error for %s (TikTok unavailable or blocked)", url)
+                return None
+
+            # Extract no-watermark SD video URL
+            video_match = re.search(
+                r'href="([^"]+)"[^>]*class="[^"]*without_watermark[^"]*"', body
+            )
+            if not video_match:
+                log.warning("ssstik.io: no without_watermark link in response for %s", url)
+                return None
+            video_url = video_match.group(1)
+
+            # Author
+            author_match = re.search(r"<h2>([^<]+)</h2>", body)
+            username = (author_match.group(1) if author_match else "").strip()
+
+            # Description
+            desc_match = re.search(r'<p class="maintext">([^<]*)</p>', body, re.DOTALL)
+            desc = desc_match.group(1).strip()[:500] if desc_match else "Untitled"
+
+            # Use custom_title if provided, otherwise clean caption or @author fallback
+            if custom_title:
+                clean_title = custom_title
+            else:
+                clean_title = clean_caption(desc) or username
+                if is_garbage_title(clean_title) and username:
+                    clean_title = f"@{username}"
+
+            # Thumbnail (avatar)
+            avatar_match = re.search(
+                r'<img[^>]*class="result_author"[^>]*src="([^"]+)"', body
+            )
+            avatar = avatar_match.group(1) if avatar_match else ""
+
+            return {
+                "webpage_url": url,
+                "title": clean_title,
+                "description": desc,
+                "video_url": video_url,
+                "thumbnail": avatar,
+                "duration": 1,
+                "username": username,
+            }
+        except Exception as e:
+            last_err = e
+            if _is_dns_error(e):
+                log.warning("ssstik mirror %s failed (DNS/conn) — switching mirror: %s",
+                            base, str(e)[:100])
+                continue
+            log.warning("ssstik.io request failed for %s: %s", url, clean_error(e))
             return None
-
-        # Extract no-watermark SD video URL
-        video_match = re.search(
-            r'href="([^"]+)"[^>]*class="[^"]*without_watermark[^"]*"', body
-        )
-        if not video_match:
-            log.warning("ssstik.io: no without_watermark link in response for %s", url)
-            return None
-        video_url = video_match.group(1)
-
-        # Author
-        author_match = re.search(r"<h2>([^<]+)</h2>", body)
-        username = (author_match.group(1) if author_match else "").strip()
-
-        # Description
-        desc_match = re.search(r'<p class="maintext">([^<]*)</p>', body, re.DOTALL)
-        desc = desc_match.group(1).strip()[:500] if desc_match else "Untitled"
-
-        # Use custom_title if provided, otherwise clean caption or @author fallback
-        if custom_title:
-            clean_title = custom_title
-        else:
-            clean_title = clean_caption(desc) or username
-            if is_garbage_title(clean_title) and username:
-                clean_title = f"@{username}"
-
-        # Thumbnail (avatar)
-        avatar_match = re.search(
-            r'<img[^>]*class="result_author"[^>]*src="([^"]+)"', body
-        )
-        avatar = avatar_match.group(1) if avatar_match else ""
-
-        return {
-            "webpage_url": url,
-            "title": clean_title,
-            "description": desc,
-            "video_url": video_url,
-            "thumbnail": avatar,
-            "duration": 1,
-            "username": username,
-        }
-    except Exception as e:
-        log.warning("ssstik.io request failed for %s: %s", url, clean_error(e))
-        return None
+    log.warning("ssstik all mirrors failed for %s: %s", url, str(last_err)[:120])
+    return None
 
 
 def _ydl_opts(**kw) -> dict:
