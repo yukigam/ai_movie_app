@@ -367,15 +367,58 @@ def slug_id(name: str) -> str:
 
 STORAGE_BUCKET = "videos"
 
+# Transient network errors (DNS lookup failure `[Errno -2]`, connection
+# reset, `getaddrinfo failed`) are retried with backoff — one bad DNS blip
+# must never abort a bucket check or a video upload.
+NET_RETRIES = 3
+NET_BACKOFF = [2.0, 4.0, 8.0]
+
+
+def _is_dns_error(e: Exception) -> bool:
+    """True for DNS/connection-class errors worth an immediate retry."""
+    msg = str(e).lower()
+    return (
+        "name or service not known" in msg
+        or "getaddrinfo" in msg
+        or "temporary failure in name resolution" in msg
+        or "connection reset" in msg
+        or "connection aborted" in msg
+        or "connection refused" in msg
+        or "network is unreachable" in msg
+        or "nodename nor servname" in msg
+        or isinstance(e, (ConnectionError, TimeoutError))
+    )
+
+
+def _net_retry(fn, *args, label: str = "", **kwargs):
+    """Run *fn* retrying DNS/connection-class errors with backoff.
+    Returns fn's result; raises the LAST exception when all tries fail
+    (callers' try/except handles it — the app never crashes unguarded)."""
+    last = None
+    for i in range(NET_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if not _is_dns_error(e) or i == NET_RETRIES - 1:
+                break
+            log.warning("Transient network error%s (try %d/%d): %s — retrying in %.0fs",
+                        f" [{label}]" if label else "", i + 1, NET_RETRIES, str(e)[:100],
+                        NET_BACKOFF[i])
+            import time as _t
+            _t.sleep(NET_BACKOFF[i])
+    raise last
+
+
 def _ensure_videos_bucket(db: Client) -> bool:
     """Create the `videos` storage bucket if it doesn't exist.  Return True if ready."""
     import httpx as _httpx
     try:
-        buckets = db.storage.list_buckets()
+        buckets = _net_retry(db.storage.list_buckets, label="bucket-list")
         if any(b.name == STORAGE_BUCKET for b in buckets):
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Storage bucket list failed (DNS/network): %s", str(e)[:120])
     # Create via REST (the supabase-py storage client API varies)
     try:
         headers = {
@@ -383,11 +426,13 @@ def _ensure_videos_bucket(db: Client) -> bool:
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
-        r = _httpx.post(
+        r = _net_retry(
+            _httpx.post,
             f"{SUPABASE_URL}/storage/v1/bucket",
             json={"name": STORAGE_BUCKET, "public": True},
             headers=headers,
             timeout=10.0,
+            label="bucket-create",
         )
         r.raise_for_status()
         log.info("Created public storage bucket '%s'", STORAGE_BUCKET)
@@ -492,16 +537,16 @@ def _fetch_video_ssstik(url: str, custom_title: str | None = None) -> dict | Non
         })
 
         # Step 1 — fetch homepage to get CSRF token
-        r1 = s.get(SSSTIK_URL)
+        r1 = _net_retry(s.get, SSSTIK_URL, label="ssstik-home")
         m = re.search(r"s_tt = '([^']+)'", r1.text)
         tt = m.group(1) if m else ""
 
         # Step 2 — submit video URL
-        r2 = s.post(f"{SSSTIK_URL}/abc?url=dl", data={
-            "id": url,
-            "locale": "en",
-            "tt": tt,
-        })
+        r2 = _net_retry(
+            s.post, f"{SSSTIK_URL}/abc?url=dl",
+            data={"id": url, "locale": "en", "tt": tt},
+            label="ssstik-submit",
+        )
         body = r2.text
 
         if "panel critical" in body or "serious problem" in body:
@@ -649,7 +694,8 @@ def _fetch_video_ytdlp(url: str, custom_title: str | None = None) -> dict | None
 def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None:
     """Extract video via tikwm.com free API (no API key needed)."""
     try:
-        resp = httpx.post(
+        resp = _net_retry(
+            httpx.post,
             "https://www.tikwm.com/api/",
             data={"url": url, "hd": 1},
             headers={
@@ -661,6 +707,7 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             timeout=30.0,
+            label="tikwm",
         )
         resp.raise_for_status()
         body = resp.json()
@@ -774,8 +821,11 @@ def _fetch_video_direct(url: str, custom_title: str | None = None) -> dict | Non
         cookie = _load_cookies_header()
         if cookie:
             headers["Cookie"] = cookie
-        resp = _httpx.get(_clean_url(url), headers=headers,
-                          follow_redirects=True, timeout=15.0)
+        resp = _net_retry(
+            _httpx.get, _clean_url(url),
+            headers=headers, follow_redirects=True, timeout=15.0,
+            label="direct-playaddr",
+        )
         resp.raise_for_status()
         m = _DIRECT_RE.search(resp.text)
         if not m:
@@ -2740,6 +2790,28 @@ def main() -> None:
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("ERROR: EXPO_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env")
         sys.exit(1)
+
+    # ── Env sanity check: a wrong/missing host shows a CLEAR message now
+    #    instead of a cryptic `[Errno -2] Name or service not known` later.
+    try:
+        from urllib.parse import urlparse as _up
+        pu = _up(SUPABASE_URL)
+        if not pu.scheme or not pu.hostname or pu.hostname.count(".") < 1:
+            print(f"ERROR: EXPO_PUBLIC_SUPABASE_URL is not a valid URL: '{SUPABASE_URL}'")
+            sys.exit(1)
+        log.info("Supabase host: %s (project: %s)", pu.hostname,
+                 pu.hostname.split(".")[0])
+    except Exception as e:
+        print(f"ERROR: EXPO_PUBLIC_SUPABASE_URL unparseable: {SUPABASE_URL} ({e})")
+        sys.exit(1)
+    if os.getenv("DATABASE_URL"):
+        log.info("DATABASE_URL set — app verifies/inits its own schema on first run")
+    else:
+        log.info("DATABASE_URL not set — Supabase RestAPI is used exclusively (fine)")
+    if os.getenv("RAPIDAPI_KEY"):
+        log.info("RAPIDAPI fallback configured")
+    else:
+        log.info("RAPIDAPI_KEY not set — yt-dlp + web scraping only")
 
     # Verify storage bucket at startup
     db = create_client(SUPABASE_URL, SUPABASE_KEY)

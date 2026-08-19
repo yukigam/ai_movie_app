@@ -298,13 +298,29 @@ def _api_item_list(username: str, sec_uid: str,
             for _page in range(14):  # 15/page → up to 210 videos
                 q = dict(query)
                 q["cursor"] = str(cursor)
-                try:
-                    resp = cli.get(_ITEM_LIST_API, params=q)
-                    resp.raise_for_status()
-                    data = resp.json()
-                except Exception as e:
-                    log.warning("item_list API page %d failed: %s",
-                                _page + 1, str(e)[:100])
+                page_ok = False
+                for _try in range(3):  # DNS/connection drift -> retry in place
+                    try:
+                        resp = cli.get(_ITEM_LIST_API, params=q)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        page_ok = True
+                        break
+                    except Exception as e:
+                        msg = str(e)[:100]
+                        if _try < 2 and (
+                            "name or service not known" in msg.lower()
+                            or "getaddrinfo" in msg.lower()
+                            or isinstance(e, (ConnectionError, TimeoutError))
+                        ):
+                            log.warning("item_list API page %d transient error (try %d/3): %s — retrying",
+                                        _page + 1, _try + 2, msg)
+                            _time.sleep(2.0 * (_try + 1))
+                            continue
+                        log.warning("item_list API page %d failed: %s",
+                                    _page + 1, msg)
+                        break
+                if not page_ok:
                     break
                 batch = data.get("itemList") or []
                 if not batch:
