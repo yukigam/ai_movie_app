@@ -30,6 +30,17 @@ try:
 except Exception:
     pass
 
+# Windows consoles default to cp1252 — force UTF-8 so progress/emoji text
+# (✅ ❌ 🔍) never crashes on print.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 async def run(url: str, expected: int | None = None) -> int:
     import telegram_bot as bot

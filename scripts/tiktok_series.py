@@ -250,6 +250,82 @@ def _drama_matches(scope: dict, drama_id: str | None) -> dict | None:
 _ITEM_LIST_API = "https://www.tiktok.com/api/creator/item_list/"
 
 
+def _drama_episodes_via_desc(items: list[dict], title: str, num_videos: int,
+                            username: str) -> list[dict]:
+    """Identify a drama's episodes by CAPTION — no SSR page walk needed.
+
+    Short-drama accounts post every episode with the drama's title leading
+    the caption ('Hired by My Billionaire Baby Daddy#film#drama…',
+    '《A Vow of Two Lifetimes》#drama…').  Verified pattern: all episodes of
+    one drama share the title phrase, and release order (createTime) ==
+    episode order.  When the caption itself carries an episode number
+    ('EP.12', 'Episode 4', 'Lesson5') it is preferred.
+
+    Returns ``[{episode, url}, …]`` (1..n, clamped to *num_videos*) or []
+    when nothing matches.
+    """
+    import re as _re
+
+    norm = _re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+    words = [w for w in norm.split() if len(w) >= 3]
+    if not words:
+        return []
+
+    cands: list[dict] = []
+    for it in items:
+        desc = str(it.get("desc") or "")
+        dnorm = _re.sub(r"[^a-z0-9]+", " ", desc.lower())
+        if not dnorm:
+            continue
+        hit = sum(1 for w in words if w in dnorm)
+        if hit >= max(2, int(len(words) * 0.8)):
+            cands.append(it)
+    if not cands:
+        return []
+
+    by_num: dict[int, str] = {}
+    by_pos: list[dict] = []
+    seen: set[str] = set()
+    cands.sort(key=lambda it: int(it.get("createTime") or 0))
+    for it in cands:
+        vid = str(it.get("id") or "")
+        mm = _re.search(r"(\d{15,25})", vid)
+        vid = mm.group(1) if mm else vid
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        m = _re.search(r"(?:EP\.?|Episode|Ep|Part|Lesson)\s*[:\-]?\s*(\d+)",
+                       str(it.get("desc") or ""), _re.I)
+        if m:
+            by_num.setdefault(int(m.group(1)), vid)
+        else:
+            by_pos.append({"id": vid, "ts": int(it.get("createTime") or 0)})
+
+    if len(by_num) >= num_videos:
+        found = [{
+            "episode": n,
+            "url": "https://www.tiktok.com/@{0}/video/{1}".format(username, v),
+        } for n, v in sorted(by_num.items())]
+    else:
+        # Positional ordering within the drama's post block.
+        merged: dict[int, str] = dict(by_num)
+        for pos in by_pos:
+            next_n = (max(merged) + 1) if merged else 1
+            while next_n in merged:
+                next_n += 1
+            merged[next_n] = pos["id"]
+        found = [{
+            "episode": n,
+            "url": "https://www.tiktok.com/@{0}/video/{1}".format(username, v),
+        } for n, v in sorted(merged.items())]
+
+    found = found[:num_videos]
+    if found:
+        log.info("Caption-based drama grouping: %d/%d episodes matched '%s'",
+                 len(found), num_videos, title[:40])
+    return found
+
+
 def _api_item_list(username: str, sec_uid: str,
                    max_videos: int = MAX_ACCOUNT_VIDEOS) -> list[dict]:
     """Bulk listing of an account's videos straight from TikTok's
@@ -319,18 +395,17 @@ def _api_item_list(username: str, sec_uid: str,
     cursor = int(_time.time() * 1e3)
     try:
         with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
-            for _page in range(14):  # 15/page → up to 210 videos
+            for _page in range(20):  # 15/page → up to 300 videos
                 q = dict(query)
                 q["cursor"] = str(cursor)
                 api_url = _ITEM_LIST_API
                 mirrored_api = False
-                page_ok = False
+                data = None
                 for _try in range(3):  # DNS/connection drift -> retry in place
                     try:
                         resp = cli.get(api_url, params=q)
                         resp.raise_for_status()
                         data = resp.json()
-                        page_ok = True
                         break
                     except Exception as e:
                         msg = str(e)[:100]
@@ -348,26 +423,35 @@ def _api_item_list(username: str, sec_uid: str,
                             continue
                         log.warning("item_list API page %d failed: %s",
                                     _page + 1, msg)
+                        data = None
                         break
-                if not page_ok:
+                if data is None:
                     break
                 batch = data.get("itemList") or []
-                if not batch:
-                    break
                 items.extend(b for b in batch
                              if isinstance(b, dict) and b.get("id"))
-                last = batch[-1]
-                if not data.get("hasMorePrevious") or not isinstance(last, dict):
+                more = bool(data.get("hasMorePrevious"))
+                if not more or len(items) >= max_videos:
                     break
-                try:
-                    new_cursor = int(float(last.get("createTime") or 0) * 1e3)
-                except (TypeError, ValueError):
-                    new_cursor = 0
+                last = batch[-1] if batch else None
+                new_cursor = 0
+                if isinstance(last, dict):
+                    try:
+                        new_cursor = int(float(last.get("createTime") or 0) * 1e3)
+                    except (TypeError, ValueError):
+                        new_cursor = 0
+                if not batch:
+                    # Rate-limit window: TikTok occasionally serves an empty
+                    # page while hasMorePrevious stays true.  Never break on
+                    # that (it silently drops the NEWEST videos — the very
+                    # episodes an ongoing drama imports need); step back a
+                    # week and keep going.
+                    log.warning("item_list API page %d empty (hasMorePrevious=%s) — "
+                                "stepping cursor back a week", _page + 1, more)
+                    new_cursor = int(float(cursor) - 7 * 86400 * 1e3)
                 if not new_cursor or new_cursor == cursor or new_cursor <= 0:
                     break
                 cursor = new_cursor
-                if len(items) >= max_videos:
-                    break
                 _time.sleep(_rand.uniform(0.4, 0.9))
     except Exception as e:
         log.warning("item_list API failed entirely: %s", str(e)[:100])
@@ -385,9 +469,11 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
 
     FAST PATH FIRST: when the account's secUid is known, the full item
     list is pulled from the bulk ``creator/item_list`` API (a handful of
-    requests, ``dramaInfo`` included) — the 1-by-1 page walk then covers
-    only videos the API did not resolve.  This fixes the "only 1/50
-    episodes" stall where a rate-limited walk crawls for minutes.
+    requests) so the account is fully enumerated even when yt-dlp's
+    profile extractor is blocked.  NOTE: the bulk payload carries NO
+    ``dramaInfo`` (2026 API) — the per-video page walk is therefore the
+    real episode-number source and runs over every video unless the bulk
+    API managed to number episodes directly.
 
     Covers multi-PAGE (tabbed) dramas — TikTok splits long series into
     episode groups ("1-24", "25-48", ...) in the sidebar — because the
@@ -491,6 +577,17 @@ def _select_drama_episodes(entries, username, drama_id, expected, progress_cb=No
         if by_num:
             log.info("Bulk API resolved %d/%d episodes directly",
                      len(by_num), expected)
+        else:
+            # Issue in the wild: TikTok's item_list payload does NOT carry
+            # a dramaInfo block (2026: itemStruct has no dramaInfo key) —
+            # only the per-video page rehydration has the episode number.
+            # In that case the walk MUST cover every video; otherwise the
+            # api_fetched set would skip the walk and return 0 episodes.
+            if api_fetched:
+                log.info("Bulk API carried no dramaInfo for this drama — "
+                         "falling back to the full per-video page walk (%d videos)",
+                         len(api_fetched))
+                api_fetched = set()
 
     pending = [v for v in vids if v not in api_fetched]
     if pending:
@@ -687,16 +784,41 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
             expected = meta.get("expected") or 0
             if drama_id and expected:
                 # Official dramaID + official total known — ONLY aligned
-                # videos are imported: walk the account pages and HARD-STOP
-                # the moment the official total (e.g. 50) is collected.
-                # The account may hold 200-300 unrelated videos, and
-                # episodes numbered above the official total are rejected —
-                # none of that junk ever reaches the import list.
+                # videos are imported; HARD-STOP the moment the official
+                # total (e.g. 50) is collected.  The account may hold
+                # 200-300 unrelated videos, and episodes numbered above the
+                # official total are rejected — none of that junk ever
+                # reaches the import list.
                 prog(f"Цувралын албан ёсны ангийн тоо: {expected} — "
                      f"илүүг татахгүй, шүүж эхэлж байна…")
-                selected = _select_drama_episodes(
-                    entries, username, drama_id, expected, progress_cb,
-                    sec_uid=meta.get("sec_uid"))
+                # Fast path: caption-based grouping over the bulk item list
+                # (TikTok posts every drama episode with the drama title in
+                # the caption; release order == episode order).  No SSR walk.
+                selected: list[dict] = []
+                if meta.get("sec_uid"):
+                    try:
+                        raw_items = _api_item_list(username, meta["sec_uid"])
+                        if raw_items:
+                            selected = _drama_episodes_via_desc(
+                                raw_items, meta.get("series_title") or "",
+                                expected, username)
+                    except Exception as e:
+                        log.warning("Caption-based drama grouping failed: %s",
+                                    str(e)[:100])
+                if len(selected) < expected:
+                    # Fill any gaps with the per-video page walk (SSR
+                    # dramaInfo only exists on the page you open — 2026
+                    # TikTok's SSR — so this covers captions it missed).
+                    walked = _select_drama_episodes(
+                        entries, username, drama_id, expected, progress_cb,
+                        sec_uid=meta.get("sec_uid"))
+                    if walked or not selected:
+                        by_ep: dict[int, dict] = {
+                            e["episode"]: e for e in walked
+                        }
+                        for e in selected:
+                            by_ep.setdefault(e["episode"], e)
+                        selected = [by_ep[n] for n in sorted(by_ep)][:expected]
                 if selected:
                     episodes = selected[:expected]  # hard stop at the official total
                     prog(f"Энэ цувралтай {len(episodes)}/{expected} анги таарлаа")
