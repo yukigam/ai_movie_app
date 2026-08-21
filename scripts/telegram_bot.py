@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 
@@ -183,8 +184,41 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _supabase_dns_down() -> bool:
+    """True when the Supabase project host no longer resolves.
+
+    A paused (or deleted) Supabase project loses its DNS record, so EVERY
+    request fails with `[Errno -2] Name or service not known` — on Render
+    too. Detecting it lets us show an actionable message instead of raw
+    errno noise.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(SUPABASE_URL).hostname or ""
+    except Exception:
+        return False
+    if not host:
+        return False
+    try:
+        socket.gethostbyname(host)
+        return False
+    except OSError:
+        return True
+
+
 def clean_error(e: Exception) -> str:
     msg = strip_ansi(str(e))
+    # A DNS-class error while the Supabase host itself is unresolvable
+    # means the project is paused/deleted — no retry can fix that.
+    try:
+        if _is_dns_error(e) and _supabase_dns_down():
+            return ("⚠️ Supabase төсөл PAUSED болсон байна "
+                    "(DNS record олдсонгүй).\n"
+                    "Шийдэх: supabase.com/dashboard нээж төслөө сонгоод "
+                    "'Restore project' дарж сэргээнэ үү.\n"
+                    "Сэргэсний дараа киноны линкийг дахин илгээнэ үү.")
+    except Exception:
+        pass
     if len(msg) > 400:
         msg = msg[:400] + "…"
     return msg
@@ -2830,6 +2864,19 @@ def main() -> None:
     except Exception as e:
         print(f"ERROR: EXPO_PUBLIC_SUPABASE_URL unparseable: {SUPABASE_URL} ({e})")
         sys.exit(1)
+
+    # Loud early warning when the Supabase project is paused/deleted
+    # (its DNS record disappears → every DB call fails with Errno -2).
+    if _supabase_dns_down():
+        print("=" * 60)
+        print("WARNING: Supabase host does NOT resolve!")
+        print(f"  Host: {_up(SUPABASE_URL).hostname}")
+        print("  The project is most likely PAUSED (free tier pauses")
+        print("  after inactivity) or deleted.")
+        print("  Fix: supabase.com/dashboard -> select project -> 'Restore project'.")
+        print("  The bot will start, but ALL imports will fail until restored.")
+        print("=" * 60)
+        log.warning("Supabase DNS unresolvable — project paused? Imports will fail until restored")
     if os.getenv("DATABASE_URL"):
         log.info("DATABASE_URL set — app verifies/inits its own schema on first run")
     else:
