@@ -248,6 +248,121 @@ def _drama_matches(scope: dict, drama_id: str | None) -> dict | None:
 
 
 _ITEM_LIST_API = "https://www.tiktok.com/api/creator/item_list/"
+_DRAMA_EPISODES_API = "https://www.tiktok.com/api/drama/episode/item_list/"
+
+
+def _api_drama_episodes(drama_id: str, expected: int) -> list[dict]:
+    """Official short-drama episode list straight from TikTok's own API.
+
+    ``GET /api/drama/episode/item_list/?dramaID=…&cursor=0&count=N`` is
+    the exact endpoint the web app's Episodes sidebar calls (found in the
+    2026 webapp JS bundles).  ONE request returns every episode with its
+    OFFICIAL number (``dramaInfo.DramaVideoData.EpisodeNumber``) — even
+    though drama-episode videos are hidden from ``creator/item_list``.
+    No signature (X-Bogus) required.
+
+    Returns ``[{episode, id, create_time}, …]`` ordered by episode number,
+    clamped to *expected*; [] when TikTok refuses (param drift/rate limit).
+    """
+    import random as _rand
+    import string as _string
+
+    query = {
+        "aid": "1988",
+        "app_language": "en",
+        "app_name": "tiktok_web",
+        "browser_language": "en-US",
+        "browser_name": "Mozilla",
+        "browser_online": "true",
+        "browser_platform": "Win32",
+        "browser_version": "5.0 (Windows)",
+        "channel": "tiktok_web",
+        "cookie_enabled": "true",
+        "device_platform": "web_pc",
+        "focus_state": "true",
+        "from_page": "video",
+        "language": "en",
+        "os": "windows",
+        "priority_region": "",
+        "region": "US",
+        "screen_height": "1080",
+        "screen_width": "1920",
+        "tz_name": "UTC",
+        "webcast_language": "en",
+        "device_id": str(_rand.randint(7250000000000000000, 7325099899999994577)),
+        "verifyFp": "verify_" + "".join(_rand.choices(_string.hexdigits, k=7)),
+        "dramaID": str(drama_id),
+        "cursor": "0",
+        "count": str(max(int(expected or 0), 20)),
+    }
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+    }
+    cookie = _cookies_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        import httpx
+    except ImportError:
+        return []
+
+    out: list[dict] = []
+    cursor = 0
+    try:
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=20) as cli:
+            for _page in range(10):
+                q = dict(query)
+                q["cursor"] = str(cursor)
+                resp = cli.get(_DRAMA_EPISODES_API, params=q)
+                resp.raise_for_status()
+                data = resp.json()
+                try:
+                    code = int(data.get("statusCode") or data.get("status_code") or 0)
+                except (TypeError, ValueError):
+                    code = 0
+                if code != 0:
+                    log.warning("Drama episode API statusCode=%s (%s)",
+                                code, str(data.get("status_msg"))[:60])
+                    break
+                batch = data.get("itemList") or []
+                for it in batch:
+                    if not isinstance(it, dict):
+                        continue
+                    vid = str(it.get("id") or "")
+                    if not vid.isdigit():
+                        continue
+                    di = it.get("dramaInfo") or {}
+                    dvd = di.get("DramaVideoData") or {}
+                    try:
+                        ep = int(dvd.get("EpisodeNumber"))
+                    except (TypeError, ValueError):
+                        ep = len(out) + 1  # sequence position fallback
+                    out.append({
+                        "episode": ep,
+                        "id": vid,
+                        "create_time": it.get("createTime"),
+                    })
+                if not data.get("hasMore") or not batch:
+                    break
+                cursor += len(batch)
+                if expected and len(out) >= expected:
+                    break
+    except Exception as e:
+        log.warning("Drama episode API failed: %s", str(e)[:120])
+        return out
+
+    # De-duplicate per episode number (first wins), clamp to expected.
+    by_ep: dict[int, dict] = {}
+    for e in out:
+        by_ep.setdefault(e["episode"], e)
+    out = [by_ep[n] for n in sorted(by_ep)]
+    if expected:
+        out = [e for e in out if 1 <= e["episode"] <= expected]
+    log.info("Drama episode API: %d episodes for dramaID=%s", len(out), drama_id)
+    return out
 
 
 def _drama_episodes_via_desc(items: list[dict], title: str, num_videos: int,
@@ -777,31 +892,60 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
 
     episodes: list[dict] = []
     if username:
-        prog(f"@{username} — ангиудыг цуглуулж байна…")
-        entries = _profile_entries(username, meta.get("sec_uid"))
-        if entries:
-            drama_id = meta.get("drama_id")
-            expected = meta.get("expected") or 0
-            if drama_id and expected:
-                # Official dramaID + official total known — ONLY aligned
-                # videos are imported; HARD-STOP the moment the official
-                # total (e.g. 50) is collected.  The account may hold
-                # 200-300 unrelated videos, and episodes numbered above the
-                # official total are rejected — none of that junk ever
-                # reaches the import list.
-                prog(f"Цувралын албан ёсны ангийн тоо: {expected} — "
-                     f"илүүг татахгүй, шүүж эхэлж байна…")
-                # Fast path: caption-based grouping over the bulk item list
-                # (TikTok posts every drama episode with the drama title in
-                # the caption; release order == episode order).  No SSR walk.
-                selected: list[dict] = []
-                if meta.get("sec_uid"):
+        drama_id = meta.get("drama_id")
+        expected = meta.get("expected") or 0
+        selected: list[dict] = []
+
+        if drama_id and expected:
+            # Official dramaID + official total known — ONLY aligned
+            # videos are imported; HARD-STOP at the official total.
+            prog(f"Цувралын албан ёсны ангийн тоо: {expected} — "
+                 f"албан ёсны жагсаалтыг татаж байна…")
+            # PRIMARY fast path: TikTok's own episode-list API — ONE
+            # request returns ALL episodes with official numbering,
+            # even though those videos are hidden from item_list.
+            try:
+                api_eps = _api_drama_episodes(drama_id, expected)
+            except Exception as e:
+                log.warning("Drama episode API crashed: %s", str(e)[:100])
+                api_eps = []
+            if api_eps:
+                by_ep: dict[int, dict] = {}
+                for e in api_eps:
+                    by_ep.setdefault(e["episode"], e)
+                selected = [
+                    {"episode": n,
+                     "url": "https://www.tiktok.com/@{0}/video/{1}".format(
+                         username, by_ep[n]["id"])}
+                    for n in sorted(by_ep)
+                ]
+                prog(f"Албан ёсны API-аас {len(selected)}/{expected} анги шууд ирлээ")
+
+        if drama_id and expected and len(selected) >= expected:
+            episodes = selected[:expected]  # hard stop at the official total
+            prog(f"Энэ цувралтай {len(episodes)}/{expected} анги таарлаа")
+        else:
+            # Slow fallbacks — they need the account's video list first.
+            prog(f"@{username} — ангиудыг цуглуулж байна…")
+            entries = _profile_entries(username, meta.get("sec_uid"))
+            if entries and drama_id and expected:
+                # Secondary: caption-based grouping over the bulk item list
+                # (some dramas carry the title in every caption; release
+                # order == episode order).  No SSR walk.
+                if len(selected) < expected and meta.get("sec_uid"):
                     try:
                         raw_items = _api_item_list(username, meta["sec_uid"])
                         if raw_items:
-                            selected = _drama_episodes_via_desc(
+                            desc_sel = _drama_episodes_via_desc(
                                 raw_items, meta.get("series_title") or "",
                                 expected, username)
+                            seen_ids = {e["url"].rsplit("/", 1)[-1]
+                                        for e in selected}
+                            for e in desc_sel:
+                                vid = e["url"].rsplit("/", 1)[-1]
+                                if vid not in seen_ids:
+                                    selected.append(e)
+                                    seen_ids.add(vid)
                     except Exception as e:
                         log.warning("Caption-based drama grouping failed: %s",
                                     str(e)[:100])
