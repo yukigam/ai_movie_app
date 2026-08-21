@@ -124,6 +124,14 @@ FETCH_WATCHDOG = 10.0
 DB_WATCHDOG = 40.0
 UPLOAD_WATCHDOG = 150.0
 
+# Parallel upload pipeline: how many episodes are downloaded from the CDN
+# and pushed to Supabase Storage AT THE SAME TIME inside one import.
+# The old sequential loop spent 30-60s per episode (download + upload +
+# thumbnail + DB write, one after another) → a 50-episode series crawled
+# for ~30 min.  6 workers ≈ 50 episodes in 3-5 minutes; RAM stays bounded
+# because each worker holds at most ONE video's bytes (~10 MB).
+IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "6"))
+
 # Retry-pass cap: per-episode timeout escalates 20s → 40s → 80s → 120s and
 # then stays at this value until the episode downloads successfully.
 MAX_RETRY_TIMEOUT = 120.0
@@ -2537,6 +2545,10 @@ async def _insert(msg, videos: list[dict], force: bool = False,
         if bulk_rows:
             await _db_call(store.bulk_upsert_pending, skey, bulk_rows)
 
+        # ── Work list: episodes that actually need a download+upload ────
+        # (skip/pending/broken checks stay sequential — they are fast DB
+        # reads; the HEAVY part below runs in parallel.)
+        todo: list[dict] = []
         for v in ordered:
             ep = v["_ep"]
             processed += 1
@@ -2557,50 +2569,67 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                     "EP %s of %s exists but is %s — re-importing (overwrite)",
                     ep, stitle, "forced" if force else ("pending/broken" if (skey, ep) not in pre_registered else "just pre-registered"),
                 )
+            todo.append(v)
 
-            # Upload video & thumbnail to Supabase Storage (replaces tikcdn.io URLs)
-            await _safe_edit(
-                msg,
-                f"📦 [{idx}/{total_groups}] *{stitle}* — EP {ep} ({processed}/{total_episodes})\n"
-                f"⬆️ Uploading video to storage…",
-                parse_mode="Markdown",
-            )
-            try:
-                preloaded = v.get("_video_bytes") or None
-                video_url = await _upload_video_watchdog(store, skey, ep, v["video_url"], preloaded)
-                thumb_url = v["thumbnail"]
-                if thumb_url:
-                    thumb_url = await _db_call(store.upload_thumbnail, skey, ep, thumb_url)
-            except Exception as e:
-                # Skip-and-log: an upload crash must never abort the series —
-                # mark the episode failed and continue with the next one.
-                log.error("Upload crashed for EP %s of %s: %s — queued for retry",
-                          ep, stitle, clean_error(e))
+        # ── PARALLEL upload pipeline ────────────────────────────────────
+        # IMPORT_WORKERS episodes at a time: CDN download → storage POST →
+        # thumbnail → DB row.  A 50-episode series finishes in minutes
+        # instead of half an hour; each worker holds ≤1 video in RAM.
+        sem = asyncio.Semaphore(max(1, IMPORT_WORKERS))
+        done_count = 0
+
+        async def _process_one(v: dict) -> None:
+            nonlocal done_count, inserted
+            ep = v["_ep"]
+            async with sem:
+                try:
+                    preloaded = v.get("_video_bytes") or None
+                    video_url = await _upload_video_watchdog(store, skey, ep, v["video_url"], preloaded)
+                    thumb_url = v["thumbnail"]
+                    if video_url and thumb_url:
+                        thumb_url = await _db_call(store.upload_thumbnail, skey, ep, thumb_url)
+                except Exception as e:
+                    # Skip-and-log: an upload crash must never abort the series —
+                    # mark the episode failed and continue with the next one.
+                    log.error("Upload crashed for EP %s of %s: %s — queued for retry",
+                              ep, stitle, clean_error(e))
+                    v.pop("_video_bytes", None)
+                    failed.append((skey, ep, stitle, v))
+                    return
+                # Free the downloaded bytes NOW — keeping every episode's video in
+                # RAM for the whole import would pin 10–50 MB × N episodes (OOM).
                 v.pop("_video_bytes", None)
-                failed.append((skey, ep, stitle, v))
-                continue
 
-            # Free the downloaded bytes NOW — keeping every episode's video in
-            # RAM for the whole import would pin 10–50 MB × N episodes (OOM).
-            v.pop("_video_bytes", None)
+                if not video_url:
+                    # Upload failed (download error or content < MIN_VIDEO_SIZE).
+                    # Never store an empty URL — queue for the strict retry pass.
+                    log.warning("Upload failed for EP %s of %s — queued for retry", ep, stitle)
+                    failed.append((skey, ep, stitle, v))
+                    return
 
-            if not video_url:
-                # Upload failed (download error or content < MIN_VIDEO_SIZE).
-                # Never store an empty URL — queue for the strict retry pass.
-                log.warning("Upload failed for EP %s of %s — queued for retry", ep, stitle)
-                failed.append((skey, ep, stitle, v))
-                continue
+                v["video_url"] = video_url
+                v["thumbnail"] = thumb_url
+                await _db_call(store.upsert_episode, skey, ep, v, ep <= DEFAULT_FREE_FIRST)
+                inserted += 1
+                inserted_eps.append((skey, ep, stitle, v))
 
-            v["video_url"] = video_url
-            v["thumbnail"] = thumb_url
-            await _db_call(store.upsert_episode, skey, ep, v, ep <= DEFAULT_FREE_FIRST)
-            inserted += 1
-            inserted_eps.append((skey, ep, stitle, v))
-
+            done_count += 1
             # Per-episode memory hygiene: return video bytes to the OS and
             # log RSS so RAM growth stays visible in the Render logs.
             gc.collect()
             _log_memory(f"after EP {ep} of {stitle}")
+
+        if todo:
+            tasks = [asyncio.create_task(_process_one(v)) for v in todo]
+            for fut in asyncio.as_completed(tasks):
+                await fut
+                if done_count and (done_count % 5 == 0 or done_count == len(todo)):
+                    await _safe_edit(
+                        msg,
+                        f"📦 [{idx}/{total_groups}] *{stitle}* — "
+                        f"{done_count}/{len(todo)} анги байршуулж байна…",
+                        parse_mode="Markdown",
+                    )
 
     # ── Strict retry pass: re-download + re-upload every failed episode,
     #    up to MAX_UPLOAD_ATTEMPTS rounds.  Each attempt runs the full
@@ -2650,10 +2679,20 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     broken_eps: list[tuple] = []
     if inserted_eps:
         await _safe_edit(msg, "🔍 Шалгаж байна: upload-д орсон видеонууд…")
-        for skey, ep, stitle, v in inserted_eps:
-            if store.is_episode_video_broken(skey, ep):
-                log.warning("Auto-clean: EP %s of %s storage object broken — re-importing", ep, stitle)
-                broken_eps.append((skey, ep, stitle, v))
+        # Parallel health check — one storage HEAD per episode, N at a time.
+        bsem = asyncio.Semaphore(max(1, IMPORT_WORKERS))
+
+        async def _check_broken(entry: tuple) -> tuple | None:
+            bk, bep, bt, bv = entry
+            async with bsem:
+                broken = await _db_call(store.is_episode_video_broken, bk, bep)
+            if broken:
+                log.warning("Auto-clean: EP %s of %s storage object broken — re-importing", bep, bt)
+                return entry
+            return None
+
+        results = await asyncio.gather(*[_check_broken(e) for e in inserted_eps])
+        broken_eps = [r for r in results if r is not None]
         if broken_eps:
             for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
                 if not broken_eps:
