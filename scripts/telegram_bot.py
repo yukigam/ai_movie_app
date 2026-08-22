@@ -132,6 +132,13 @@ UPLOAD_WATCHDOG = 150.0
 # because each worker holds at most ONE video's bytes (~10 MB).
 IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "6"))
 
+# Memory soft limit (MB).  Render's free container is killed at ~512 MB RSS;
+# parallel yt-dlp subprocesses + in-RAM video bytes can spike past that and
+# OOM-restart the service mid-import (only 1 of N episodes survives).
+# When process RSS exceeds this soft limit, downloads are SERIALIZED
+# (one video / one yt-dlp at a time) until memory recovers.  0 disables.
+MEMORY_SOFT_LIMIT_MB = int(os.getenv("MEMORY_SOFT_LIMIT_MB", "380"))
+
 # Deployed-commit marker: Render injects RENDER_GIT_COMMIT at build time.
 # `/version` in Telegram reveals exactly which code the service runs —
 # no Dashboard access needed for remote diagnosis.
@@ -1705,6 +1712,15 @@ async def _fetch_episode_source(url: str, custom_title: str | None = None) -> di
     episode is force-skipped and the import moves on to the next one —
     a stalled TikTok/ssstik/yt-dlp call can never hang the loop again.
     Safe to run in parallel via asyncio.gather (no video bytes kept)."""
+    # Memory guard: each yt-dlp subprocess costs ~50-100 MB — under pressure
+    # run them ONE at a time so a 512 MB container never OOM-restarts.
+    if _under_memory_pressure():
+        log.info("[mem] pressure before fetch %s… — serializing", url[-30:])
+        async with _MEMORY_LOCK:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_fetch_video, url, custom_title),
+                timeout=FETCH_WATCHDOG,
+            )
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(_fetch_video, url, custom_title),
@@ -2476,20 +2492,31 @@ async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = No
         log.warning("Healthy-episode query for %s failed: %s", skey, clean_error(e))
     return have
 
-def _log_memory(tag: str) -> None:
-    """Log the process RSS so RAM growth is visible in Render logs.
-
-    Reads /proc/self/status (Linux — Render); a silent no-op elsewhere.
-    """
+def _rss_mb() -> float | None:
+    """Process RSS in MB (Linux — Render), or None where unavailable."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
-                    kb = int(line.split()[1])
-                    log.info("[mem:%s] RSS=%.1f MB", tag, kb / 1024)
-                    return
+                    return int(line.split()[1]) / 1024.0
     except Exception:
         pass
+    return None
+
+_MEMORY_LOCK = asyncio.Lock()
+
+def _under_memory_pressure() -> bool:
+    """True when RSS is above the soft limit and throttling must kick in."""
+    if MEMORY_SOFT_LIMIT_MB <= 0:
+        return False
+    rss = _rss_mb()
+    return rss is not None and rss > MEMORY_SOFT_LIMIT_MB
+
+def _log_memory(tag: str) -> None:
+    """Log the process RSS so RAM growth is visible in Render logs."""
+    rss = _rss_mb()
+    if rss is not None:
+        log.info("[mem:%s] RSS=%.1f MB", tag, rss)
 
 async def _insert(msg, videos: list[dict], force: bool = False,
                   official_total: int | None = None) -> None:
@@ -2646,7 +2673,9 @@ async def _insert(msg, videos: list[dict], force: bool = False,
         async def _process_one(v: dict) -> None:
             nonlocal done_count, inserted
             ep = v["_ep"]
-            async with sem:
+
+            async def _do_upload() -> None:
+                nonlocal inserted
                 try:
                     preloaded = v.get("_video_bytes") or None
                     video_url = await _upload_video_watchdog(store, skey, ep, v["video_url"], preloaded)
@@ -2677,6 +2706,17 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                 await _db_call(store.upsert_episode, skey, ep, v, ep <= DEFAULT_FREE_FIRST)
                 inserted += 1
                 inserted_eps.append((skey, ep, stitle, v))
+
+            async with sem:
+                # Memory guard: when RSS approaches the container limit,
+                # serialize so at most ONE video sits in RAM at a time.
+                if _under_memory_pressure():
+                    log.info("[mem] pressure %.0f MB > %d MB — serializing EP %s",
+                             _rss_mb() or 0, MEMORY_SOFT_LIMIT_MB, ep)
+                    async with _MEMORY_LOCK:
+                        await _do_upload()
+                else:
+                    await _do_upload()
 
             done_count += 1
             # Per-episode memory hygiene: return video bytes to the OS and
