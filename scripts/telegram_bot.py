@@ -1931,6 +1931,7 @@ async def _complete_series_pending_rows(skey: str, stitle: str,
             data.pop("_video_bytes", None)
             if not rvideo:
                 continue
+            data["video_url"] = rvideo
             data["title"] = f"{stitle} EP.{ep}"
             data["_page_url"] = src
             data["thumbnail"] = data.get("thumbnail") or ""
@@ -2064,6 +2065,7 @@ async def _final_sweep_for_series(series_title: str, last_ep_num: int) -> None:
             if not rvideo:
                 still_missing.append(ep)
                 continue
+            data["video_url"] = rvideo
             data["title"] = f"{series_title} EP.{ep}"
             data["_page_url"] = src
             data["thumbnail"] = data.get("thumbnail") or ""
@@ -2832,6 +2834,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                         still_pending.append((skey, ep, stitle, src, title))
                         continue
                     if rvideo:
+                        data["video_url"] = rvideo
                         data["_page_url"] = src
                         data["title"] = title
                         await _db_call(store.upsert_episode, skey, ep, data, ep <= DEFAULT_FREE_FIRST)
