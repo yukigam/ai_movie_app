@@ -132,6 +132,11 @@ UPLOAD_WATCHDOG = 150.0
 # because each worker holds at most ONE video's bytes (~10 MB).
 IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "6"))
 
+# Deployed-commit marker: Render injects RENDER_GIT_COMMIT at build time.
+# `/version` in Telegram reveals exactly which code the service runs —
+# no Dashboard access needed for remote diagnosis.
+BOT_VERSION = (os.getenv("RENDER_GIT_COMMIT") or "local-dev")[:7]
+
 # Retry-pass cap: per-episode timeout escalates 20s → 40s → 80s → 120s and
 # then stays at this value until the episode downloads successfully.
 MAX_RETRY_TIMEOUT = 120.0
@@ -1448,6 +1453,15 @@ async def cmd_login(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "(httpx + yt-dlp).\n"
         "Cookies remain supported via `cookies.txt` (project root) or "
         "`TIKTOK_COOKIES_FILE`.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_version(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remote diagnostics: which commit is this service actually running?"""
+    await upd.message.reply_text(
+        f"🧬 Bot commit: `{BOT_VERSION}`\n"
+        f"🐍 Python {sys.version.split()[0]} • workers={IMPORT_WORKERS}",
         parse_mode="Markdown",
     )
 
@@ -2967,6 +2981,8 @@ def main() -> None:
             log.info("Stale webhook cleared before polling")
         except Exception as e:
             log.warning("Could not clear webhook before polling: %s", clean_error(e))
+        log.info("Bot starting — commit %s, python %s, workers=%d",
+                 BOT_VERSION, sys.version.split()[0], IMPORT_WORKERS)
         # Self-healing across restarts: pending episodes left by a crash or
         # a Render redeploy are re-imported in the background automatically.
         try:
@@ -2984,6 +3000,7 @@ def main() -> None:
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("series", cmd_series))
     app.add_handler(CommandHandler("single", cmd_single))
