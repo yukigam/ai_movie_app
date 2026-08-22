@@ -1356,16 +1356,36 @@ JOB_ABSOLUTE_TIMEOUT = 2400  # 40 min per job — a stuck loop gets reset
 
 
 async def _job_worker() -> None:
-    """Lone consumer of JOB_QUEUE — runs jobs strictly sequentially."""
+    """Lone consumer of JOB_QUEUE — runs jobs strictly sequentially.
+
+    Queue items are (job, msg, label) so the user can be told when their
+    job dies or times out instead of staring at an eternal spinner.
+    """
     while True:
-        job = await JOB_QUEUE.get()
+        job, msg, label = await JOB_QUEUE.get()
         try:
             await asyncio.wait_for(job(), timeout=JOB_ABSOLUTE_TIMEOUT)
         except asyncio.TimeoutError:
             log.error("Job exceeded %ds — cancelled; next queued job proceeds",
                       JOB_ABSOLUTE_TIMEOUT)
-        except Exception:
+            try:
+                await msg.reply_text(
+                    f"⌛ *{label}* {JOB_ABSOLUTE_TIMEOUT // 60} минутад дуусаагүй "
+                    "тул цуцаллаа. Дахин оролдоно уу — үргэлжлэл нь автоматаар "
+                    "нөхөгдөнө.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                log.exception("Failed to deliver job-timeout notice")
+        except Exception as e:
             log.exception("Job worker: job crashed")
+            try:
+                await msg.reply_text(
+                    f"❌ *{label}* амжилтгүй боллоо: {clean_error(e)}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                log.exception("Failed to deliver job-crash notice")
         finally:
             JOB_QUEUE.task_done()
 
@@ -1389,7 +1409,7 @@ async def _enqueue_job(msg, label: str, job) -> None:
             "Өмнөх импорт дууссаны дараа автоматаар эхэлнэ."
         )
     await msg.reply_text(reply, parse_mode="Markdown")
-    await JOB_QUEUE.put(job)
+    await JOB_QUEUE.put((job, msg, label))
 
 
 # ── Bot handlers ────────────────────────────────────────────────────────────
