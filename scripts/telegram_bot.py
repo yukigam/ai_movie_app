@@ -1196,30 +1196,20 @@ class Store:
         return None
 
     def is_video_url_broken(self, url: str) -> bool:
-        """True when the video cannot play: missing/0-byte storage object or expired CDN link."""
+        """True when the video cannot play: missing/0-byte storage object,
+        expired CDN link, or ANY non-storage link (legacy rows written by the
+        old CDN fallback — always re-downloaded into permanent Storage)."""
         if not url:
             return True
         m = re.search(r"/storage/v1/object/public/([^/]+)/(.+)$", url)
         if m:
             size = self._storage_object_size(m.group(1), m.group(2))
             return size is None or size <= 0
-        m = re.search(r"[?&]expire=(\d+)", url)
-        if m:
-            return int(m.group(1)) < time.time()
-        try:
-            import httpx as _httpx
-            r = _httpx.head(url, follow_redirects=True, timeout=8.0)
-            if r.status_code >= 400:
-                return True
-            ctype = (r.headers.get("content-type") or "").lower()
-            if "video" in ctype or "octet-stream" in ctype:
-                return False
-            # CDN caches often serve HEAD as 200 even after the link expired —
-            # confirm with a tiny ranged GET.
-            g = _httpx.get(url, headers={"Range": "bytes=0-0"}, follow_redirects=True, timeout=8.0)
-            return g.status_code >= 400
-        except Exception:
-            return True
+        # Non-storage link.  In a Storage-enabled deployment this is a legacy
+        # doomed URL → broken (next import heals it into Storage).  When
+        # Storage itself is unavailable, CDN links are the only option and
+        # must still count as playable.
+        return bool(self._storage_ready)
 
     def get_episode_video_url(self, sid: str, num: int) -> str:
         try:
@@ -1661,9 +1651,17 @@ async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
                                  preloaded_bytes: bytes | None = None) -> str:
     """Upload one episode's video with a hard watchdog — a stalled CDN
     download or storage POST (up to 2 min each inside) can never hang
-    the import again.  Returns the public URL or "" (callers retry/skip)."""
+    the import again.  Returns the STORAGE public URL or "" (callers
+    retry/skip).
+
+    A raw TikTok/CDN link must NEVER be persisted as the episode's
+    video_url: those links expire within hours and the episode turns into
+    an eternal "loading…" in the app.  When Storage is unavailable at
+    upload time (bucket check failed) upload_video falls back to returning
+    the source link — that fallback is rejected here so callers queue the
+    episode for retry instead of writing a doomed URL to the DB."""
     try:
-        return await asyncio.wait_for(
+        url = await asyncio.wait_for(
             asyncio.to_thread(store.upload_video, skey, ep, src_url, preloaded_bytes),
             timeout=UPLOAD_WATCHDOG,
         )
@@ -1673,6 +1671,11 @@ async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
         return ""
     except Exception:
         raise
+    if url and not url.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"):
+        log.warning("EP %s of %s: Storage unavailable — refusing to persist "
+                    "temporary CDN link (queued for retry)", ep, skey)
+        return ""
+    return url
 
 
 async def _fetch_episode_source(url: str, custom_title: str | None = None) -> dict | None:
