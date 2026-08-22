@@ -1329,7 +1329,11 @@ class Store:
             "title": data["title"],
             "description": data["description"],
             "video_url": data["video_url"],
-            "thumbnail_url": data["thumbnail"],
+            # thumbnail_url is NOT NULL with no default: a failed thumb
+            # download must NEVER become None or the whole upsert (and the
+            # parallel batch around it) crashes with 23502.  Write an empty
+            # string instead — a later heal pass overwrites it.
+            "thumbnail_url": data.get("thumbnail") or "",
             "duration": data["duration"],
             "is_free": free,
         }
