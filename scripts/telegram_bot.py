@@ -261,7 +261,9 @@ async def _safe_edit(msg, text: str, **kwargs) -> None:
 
 # ── URL helpers ─────────────────────────────────────────────────────────────
 
-_SHORT_LINK_RE = re.compile(r"https?://(?:vt|vm)\.tiktok\.com/\S+")
+_SHORT_LINK_RE = re.compile(
+    r"https?://(?:(?:vt|vm)\.tiktok\.com/|www\.tiktok\.com/t/)\S+"
+)
 _TIKTOK_DOMAIN_RE = re.compile(r"tiktok\.com/@([\w.-]+)")
 _AT_USER_RE = re.compile(r"^@([\w.-]+)$")
 
@@ -292,6 +294,14 @@ def extract_username(text: str) -> str | None:
     if m:
         return m.group(1)
     return None
+
+
+def is_tiktok_deep_link(text: str) -> bool:
+    """True for TikTok URLs that carry no @username yet are still fully
+    routable: ``/shortdrama/<dramaID>/<n>`` deep links and username-less
+    ``/video/<id>`` links.  The series/single routers resolve these via the
+    drama APIs / yt-dlp — no profile name required."""
+    return bool(re.search(r"tiktok\.com/(?:shortdrama/|[\w./-]*video/\d)", text))
 
 
 def is_profile(text: str) -> bool:
@@ -1468,9 +1478,10 @@ async def cmd_series(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     url = args[0]
-    if "tiktok.com/@" not in url:
+    if not url.startswith("http"):
+        # Bare @username or username/video/id shorthand → normalize.
         url = "https://www.tiktok.com/@" + url.lstrip("@")
-        if "/video/" not in url and not re.search(r"/\d+", url):
+        if "/video/" not in url:
             await upd.message.reply_text("Please provide a full TikTok video URL.")
             return
 
@@ -1514,9 +1525,18 @@ async def _handle_text(upd: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool 
         status = await upd.message.reply_text("⏳ Processing…")
 
     username = extract_username(text)
-    if not username:
-        await _safe_edit(status, "❌ No TikTok username or video link found in your message.")
+    if not username and not is_tiktok_deep_link(text):
+        await _safe_edit(
+            status,
+            "❌ TikTok линк олдсонгүй. Эдгээр хэлбэрийг хүлээнэ:\n"
+            "• https://www.tiktok.com/@user/video/…\n"
+            "• https://www.tiktok.com/shortdrama/episode/…\n"
+            "• vt.tiktok.com / tiktok.com/t/ товч линк\n"
+            "• @username (профайлын бүх видео)",
+        )
         return
+    if not username:
+        username = ""  # deep link — routers below need no profile name
 
     # Store custom title in context for _single to use
     if custom_title:
