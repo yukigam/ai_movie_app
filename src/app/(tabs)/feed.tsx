@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams, useFocusEffect } from 'expo-router';
 import {
   View,
   Text,
@@ -45,6 +45,16 @@ export default function FeedScreen() {
   const [modalVisible, setModalVisible] = useState(false);
   const adDataRef = useRef<{ seriesId: string; episodeId: string } | null>(null);
   const videoRefs = useRef<Record<string, VideoPlayerHandle | null>>({});
+  const [isScreenFocused, setIsScreenFocused] = useState(true);
+
+  // Tab/stack screens stay mounted in expo-router — without this the video
+  // (and its audio) keeps playing after the user leaves the feed screen.
+  useFocusEffect(
+    useCallback(() => {
+      setIsScreenFocused(true);
+      return () => setIsScreenFocused(false);
+    }, [])
+  );
 
   useEffect(() => {
     (async () => {
@@ -239,7 +249,7 @@ export default function FeedScreen() {
       const series = seriesMap[item.seriesId];
       if (!series) return null;
 
-      const isActive = index === activeIndex;
+      const isActive = index === activeIndex && isScreenFocused;
       const isLiked = likedEpisodes[item.episode.id] ?? false;
       const isUnlocked = !item.episode.isLocked || unlockedEpisodes[item.episode.id];
 
@@ -358,6 +368,7 @@ export default function FeedScreen() {
     },
     [
       activeIndex,
+      isScreenFocused,
       likedEpisodes,
       unlockedEpisodes,
       insets.top,
