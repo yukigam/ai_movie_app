@@ -290,12 +290,14 @@ def extract_username(text: str) -> str | None:
 
 
 def is_profile(text: str) -> bool:
-    """True when the message points at a PROFILE (or series/playlist/short-
-    dramas page) rather than a single video.
+    """True when the message points at a PROFILE (or series/playlist page)
+    rather than a single video or a short-drama deep link.
 
     Anything on tiktok.com/@user… that is NOT a /video/ URL is treated as a
     profile-like page — that includes bare @username links, '/short-dramas'
     tabs, '/series/<slug>' and '/playlist/<id>' pages.
+    ``/shortdrama/episode/<dramaID>/<n>`` deep links are NOT profiles —
+    they resolve to a full series via the drama APIs.
     """
     t = text.strip()
     if _AT_USER_RE.match(t):
@@ -303,7 +305,7 @@ def is_profile(text: str) -> bool:
     m = _TIKTOK_DOMAIN_RE.search(t)
     if m:
         remainder = t[m.end():]
-        if "/video/" in remainder:
+        if "/video/" in remainder or "/shortdrama/" in remainder:
             return False
         return True
     return False

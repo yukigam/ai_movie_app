@@ -50,6 +50,10 @@ REHYDRATION_RE = re.compile(
     re.S,
 )
 _USERNAME_RE = re.compile(r"tiktok\.com/@([\w.-]+)")
+# Short-drama deep link: /shortdrama/episode/{dramaID}/{episodeNum}
+# (the webapp route found in TikTok's own JS bundles — the first number
+# IS the dramaID, confirmed against /api/drama/detail/)
+_SD_EPISODE_RE = re.compile(r"/shortdrama/episode/(\d{15,25})(?:/(\d+))?", re.I)
 MAX_ACCOUNT_VIDEOS = 400  # hard cap — distributor accounts exceed 200
 
 
@@ -249,6 +253,89 @@ def _drama_matches(scope: dict, drama_id: str | None) -> dict | None:
 
 _ITEM_LIST_API = "https://www.tiktok.com/api/creator/item_list/"
 _DRAMA_EPISODES_API = "https://www.tiktok.com/api/drama/episode/item_list/"
+_DRAMA_DETAIL_API = "https://www.tiktok.com/api/drama/detail/"
+
+
+def _api_drama_detail(drama_id: str) -> dict:
+    """Official drama metadata from ``/api/drama/detail/`` (no signature).
+
+    Returns the same shape ``_drama_meta`` produces — series_title,
+    series_cover, drama_id, expected (numVideos), username, sec_uid —
+    so a /shortdrama/episode/ deep link resolves WITHOUT loading any
+    video page.  {} when TikTok refuses.
+    """
+    import random as _rand
+    import string as _string
+
+    query = {
+        "aid": "1988",
+        "app_language": "en",
+        "app_name": "tiktok_web",
+        "browser_language": "en-US",
+        "browser_name": "Mozilla",
+        "browser_online": "true",
+        "browser_platform": "Win32",
+        "channel": "tiktok_web",
+        "cookie_enabled": "true",
+        "device_platform": "web_pc",
+        "language": "en",
+        "os": "windows",
+        "priority_region": "",
+        "region": "US",
+        "tz_name": "UTC",
+        "webcast_language": "en",
+        "device_id": str(_rand.randint(7250000000000000000, 7325099899999994577)),
+        "verifyFp": "verify_" + "".join(_rand.choices(_string.hexdigits, k=7)),
+        "dramaID": str(drama_id),
+    }
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.tiktok.com/",
+    }
+    cookie = _cookies_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        import httpx
+        resp = httpx.get(_DRAMA_DETAIL_API, params=query, headers=headers,
+                         follow_redirects=True, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        code = int(data.get("statusCode") or data.get("status_code") or 0)
+        if code != 0:
+            log.warning("Drama detail API statusCode=%s for %s", code, drama_id)
+            return {}
+        di = data.get("dramaInfo") or {}
+        if not isinstance(di, dict) or not di.get("dramaName"):
+            return {}
+        meta: dict = {
+            "series_title": str(di["dramaName"]).strip(),
+            "drama_id": str(di.get("dramaID") or drama_id),
+        }
+        try:
+            expected = int(di.get("numVideos") or 0)
+        except (TypeError, ValueError):
+            expected = 0
+        if expected:
+            meta["expected"] = expected
+        clist = ((di.get("cover") or {}).get("urlList")) or []
+        if clist:
+            meta["series_cover"] = str(clist[0])
+        user = ((di.get("author") or {}).get("user")) or {}
+        if user.get("uniqueId"):
+            meta["username"] = str(user["uniqueId"])
+        if user.get("secUid"):
+            meta["sec_uid"] = str(user["secUid"])
+        desc = str(di.get("description") or "").strip()
+        if desc:
+            meta["description"] = desc
+        log.info("Drama detail API: '%s' (%s episodes) by @%s",
+                 meta["series_title"], expected, meta.get("username"))
+        return meta
+    except Exception as e:
+        log.warning("Drama detail API failed for %s: %s", drama_id, str(e)[:120])
+        return {}
 
 
 def _api_drama_episodes(drama_id: str, expected: int) -> list[dict]:
@@ -876,7 +963,22 @@ def extract_series(url: str, progress_cb=None) -> list[dict]:
 
     scope = None
     meta: dict = {}
-    if "/video/" in url:
+    sd = _SD_EPISODE_RE.search(url)
+    if sd:
+        # Short-drama deep link (/shortdrama/episode/{dramaID}/{num}) —
+        # the dramaID is IN the URL; two API calls resolve everything
+        # (detail → title/cover/total/username, episodes → all IDs).
+        prog("Short-drama холбоос илэрлээ…")
+        try:
+            sd_meta = _api_drama_detail(sd.group(1))
+        except Exception as e:
+            log.warning("Short-drama detail crashed: %s", str(e)[:100])
+            sd_meta = {}
+        if sd_meta:
+            meta.update(sd_meta)
+            if meta.get("series_title"):
+                prog(f"Кино: {meta['series_title']}")
+    elif "/video/" in url:
         scope = _load_page(url)
         if scope is not None:
             meta = _drama_meta(scope)
