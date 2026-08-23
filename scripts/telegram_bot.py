@@ -508,11 +508,34 @@ def _ensure_videos_bucket(db: Client) -> bool:
         return False
 
 
-_TUS_THRESHOLD = 45 * 1024 * 1024  # plain POST dies at ~50 MB ("EntityTooLarge")
+def _pick_smaller_source(src_url: str, alt_url: str) -> str:
+    """When the primary source is oversized (>48 MB = Supabase free cap),
+    HEAD both candidates and prefer the smaller one.  Falls back to the
+    primary on any HEAD failure — never blocks the upload path."""
+    if not alt_url or not src_url.startswith("http"):
+        return src_url
+    def _cl(u: str) -> int:
+        try:
+            r = httpx.head(u, follow_redirects=True, timeout=8.0,
+                           headers={"User-Agent": "Mozilla/5.0"})
+            return int(r.headers.get("content-length") or 0)
+        except Exception:
+            return 0
+    try:
+        s, a = _cl(src_url), _cl(alt_url)
+    except Exception:
+        return src_url
+    if s > _COMPRESS_ABOVE and a and (not s or a < s):
+        log.info("Primary source %.1f MB > cap — switching to alt (%.1f MB)",
+                 s / 1e6, a / 1e6)
+        return alt_url
+    return src_url
+
 
 # Supabase free plan rejects ANY upload above 50 MB per file — even TUS.
 # Videos larger than this are transcoded down before upload.
 _COMPRESS_ABOVE = 48 * 1024 * 1024
+_TUS_THRESHOLD = 45 * 1024 * 1024  # plain POST dies at ~50 MB ("EntityTooLarge")
 
 def _compress_video(content: bytes) -> bytes:
     """Shrink videos above the Supabase free-plan 50 MB upload cap using the
@@ -616,11 +639,13 @@ def _tus_upload(remote_path: str, content: bytes, content_type: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{remote_path}"
 
 
-def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, content_type: str, preloaded_bytes: bytes | None = None) -> str:
+def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, content_type: str, preloaded_bytes: bytes | None = None, alt_url: str = "") -> str:
     """Download *src_url* and upload it to ``{STORAGE_BUCKET}/{series_id}/{prefix}_{ep_num}``.
 
     If *preloaded_bytes* is provided it is used instead of downloading *src_url*.
     Video content smaller than MIN_VIDEO_SIZE is rejected (never uploaded).
+    *alt_url* is an alternate CDN candidate swapped in when the primary
+    download would exceed the Supabase free-plan size cap.
     Returns the permanent public URL, or ``""`` on failure (callers retry).
     """
     import httpx as _httpx
@@ -637,6 +662,8 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
 
     content = preloaded_bytes
     if content is None:
+        if "video" in content_type and alt_url:
+            src_url = _pick_smaller_source(src_url, alt_url)
         try:
             resp = _httpx.get(src_url, headers=BROWSER_HEADERS, follow_redirects=True, timeout=90.0)
             resp.raise_for_status()
@@ -758,14 +785,19 @@ def _fetch_video_ssstik(url: str, custom_title: str | None = None) -> dict | Non
                 log.warning("ssstik.io error for %s (TikTok unavailable or blocked)", url)
                 return None
 
-            # Extract no-watermark SD video URL
-            video_match = re.search(
+            # Extract ALL no-watermark candidates — ssstik lists the
+            # standard link first and an HD re-encode second.  Primary =
+            # standard (smaller); the other is kept as _alt_url so the
+            # uploader can swap when the primary turns out oversized.
+            wm_links = re.findall(
                 r'href="([^"]+)"[^>]*class="[^"]*without_watermark[^"]*"', body
             )
+            video_match = wm_links[0] if wm_links else None
             if not video_match:
                 log.warning("ssstik.io: no without_watermark link in response for %s", url)
                 return None
-            video_url = video_match.group(1)
+            video_url = video_match
+            alt_hd = next((u for u in wm_links[1:] if u != video_url), "")
 
             # Author
             author_match = re.search(r"<h2>([^<]+)</h2>", body)
@@ -794,6 +826,7 @@ def _fetch_video_ssstik(url: str, custom_title: str | None = None) -> dict | Non
                 "title": clean_title,
                 "description": desc,
                 "video_url": video_url,
+                "_alt_url": alt_hd,
                 "thumbnail": avatar,
                 "duration": 1,
                 "username": username,
@@ -927,7 +960,14 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
             log.warning("tikwm.com API error for %s: %s", url, body.get("msg", ""))
             return None
         data = body.get("data") or {}
-        video_url = data.get("hdplay") or data.get("play") or ""
+        # Prefer SD ("play") — TikTok SD vertical is plenty for phones and
+        # usually 5–20 MB vs 60–160 MB for HD, so uploads skip the ffmpeg
+        # transcode entirely (huge speedup on Render's weak CPU).
+        # HD is kept as a fallback candidate (_alt_url).
+        sd_url = data.get("play") or ""
+        hd_url = data.get("hdplay") or ""
+        video_url = sd_url or hd_url
+        alt_url = hd_url if (video_url and video_url != hd_url and hd_url) else ""
         if not video_url:
             log.warning("tikwm.com: no video URL in response for %s", url)
             return None
@@ -945,6 +985,7 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
             "title": title,
             "description": (data.get("title") or title)[:500],
             "video_url": video_url,
+            "_alt_url": alt_url,
             "thumbnail": data.get("cover") or "",
             "duration": max(1, round((data.get("duration") or 30) / 60)),
             "username": data.get("author") or "",
@@ -1438,10 +1479,10 @@ class Store:
             for row in rows:
                 self.db.table("episodes").upsert(row, on_conflict="id").execute()
 
-    def upload_video(self, sid: str, num: int, src_url: str, preloaded_bytes: bytes | None = None) -> str:
+    def upload_video(self, sid: str, num: int, src_url: str, preloaded_bytes: bytes | None = None, alt_url: str = "") -> str:
         if not self._storage_ready:
             return src_url
-        return _upload_media(sid, num, src_url, "video", "video/mp4", preloaded_bytes)
+        return _upload_media(sid, num, src_url, "video", "video/mp4", preloaded_bytes, alt_url)
 
     def upload_thumbnail(self, sid: str, num: int, src_url: str) -> str:
         if not self._storage_ready or not src_url:
@@ -1488,6 +1529,7 @@ class Store:
 # forever — the next queued import proceeds automatically.
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 _job_worker_task: asyncio.Task | None = None
+_job_busy = False  # a job is currently RUNNING (queue acks must reflect this)
 JOB_ABSOLUTE_TIMEOUT = 2400  # 40 min per job — a stuck loop gets reset
 
 
@@ -1497,8 +1539,10 @@ async def _job_worker() -> None:
     Queue items are (job, msg, label) so the user can be told when their
     job dies or times out instead of staring at an eternal spinner.
     """
+    global _job_busy
     while True:
         job, msg, label = await JOB_QUEUE.get()
+        _job_busy = True
         try:
             await asyncio.wait_for(job(), timeout=JOB_ABSOLUTE_TIMEOUT)
         except asyncio.TimeoutError:
@@ -1523,6 +1567,7 @@ async def _job_worker() -> None:
             except Exception:
                 log.exception("Failed to deliver job-crash notice")
         finally:
+            _job_busy = False
             JOB_QUEUE.task_done()
 
 
@@ -1534,15 +1579,22 @@ def _ensure_job_worker() -> None:
 
 
 async def _enqueue_job(msg, label: str, job) -> None:
-    """Push *job* onto the sequential queue and reply with its position."""
+    """Push *job* onto the sequential queue and reply with its position.
+
+    The worker may still be busy with a PREVIOUS import while the queue
+    itself is empty — reporting "starting now" in that case made users
+    think the bot froze (no feedback until the earlier job finished).
+    """
     _ensure_job_worker()
-    pos = JOB_QUEUE.qsize() + 1
-    if pos == 1:
+    waiting = JOB_QUEUE.qsize() + (1 if _job_busy else 0)
+    if waiting == 0:
         reply = f"⏳ *{label}* эхэлж байна…"
     else:
         reply = (
-            f"⏳ *{label}* дараалалд орлоо (байр: #{pos}).\n"
-            "Өмнөх импорт дууссаны дараа автоматаар эхэлнэ."
+            f"⏳ *{label}* дараалалд орлоо (байр: #{waiting}).\n"
+            f"Одоо өөр импорт ажиллаж байна ({waiting} ажил урьдчилан).\n"
+            "Дараалал хүрэхэд автоматаар эхэлнэ — хаалттай мессеж шидэхгүй "
+            "хүлээж байна уу."
         )
     await msg.reply_text(reply, parse_mode="Markdown")
     await JOB_QUEUE.put((job, msg, label))
@@ -1795,7 +1847,8 @@ async def _db_call(fn, *args, **kwargs):
 
 
 async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
-                                 preloaded_bytes: bytes | None = None) -> str:
+                                 preloaded_bytes: bytes | None = None,
+                                 alt_url: str = "") -> str:
     """Upload one episode's video with a hard watchdog — a stalled CDN
     download or storage POST (up to 2 min each inside) can never hang
     the import again.  Returns the STORAGE public URL or "" (callers
@@ -1809,7 +1862,8 @@ async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
     episode for retry instead of writing a doomed URL to the DB."""
     try:
         url = await asyncio.wait_for(
-            asyncio.to_thread(store.upload_video, skey, ep, src_url, preloaded_bytes),
+            asyncio.to_thread(store.upload_video, skey, ep, src_url,
+                              preloaded_bytes, alt_url),
             timeout=UPLOAD_WATCHDOG,
         )
     except asyncio.TimeoutError:
@@ -2083,7 +2137,8 @@ async def _complete_series_pending_rows(skey: str, stitle: str,
             if not data or not data.get("video_url"):
                 continue
             rvideo = await _upload_video_watchdog(
-                store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
+                store, skey, ep, data["video_url"], data.get("_video_bytes") or None,
+                data.get("_alt_url") or "")
             data.pop("_video_bytes", None)
             if not rvideo:
                 continue
@@ -2216,7 +2271,8 @@ async def _final_sweep_for_series(series_title: str, last_ep_num: int) -> None:
                 still_missing.append(ep)
                 continue
             rvideo = await _upload_video_watchdog(
-                store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
+                store, skey, ep, data["video_url"], data.get("_video_bytes") or None,
+                data.get("_alt_url") or "")
             data.pop("_video_bytes", None)
             if not rvideo:
                 still_missing.append(ep)
@@ -2798,7 +2854,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                 nonlocal inserted
                 try:
                     preloaded = v.get("_video_bytes") or None
-                    video_url = await _upload_video_watchdog(store, skey, ep, v["video_url"], preloaded)
+                    video_url = await _upload_video_watchdog(
+                        store, skey, ep, v["video_url"], preloaded, v.get("_alt_url") or "")
                     thumb_url = v["thumbnail"]
                     if video_url and thumb_url:
                         thumb_url = await _db_call(store.upload_thumbnail, skey, ep, thumb_url)
@@ -2879,7 +2936,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                         still.append((fkey, fep, ftitle, fv))
                         continue
                     rvideo = await _upload_video_watchdog(
-                        store, fkey, fep, data["video_url"], data.get("_video_bytes") or None)
+                        store, fkey, fep, data["video_url"], data.get("_video_bytes") or None,
+                        data.get("_alt_url") or "")
                     data.pop("_video_bytes", None)
                 except Exception as e:
                     log.error("Retry crashed for EP %s of %s: %s — keeping it for the next round",
@@ -2931,7 +2989,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                             still_broken.append((bkey, bep, btitle, bv))
                             continue
                         rvideo = await _upload_video_watchdog(
-                            store, bkey, bep, data["video_url"], data.get("_video_bytes") or None)
+                            store, bkey, bep, data["video_url"], data.get("_video_bytes") or None,
+                            data.get("_alt_url") or "")
                         data.pop("_video_bytes", None)
                     except Exception as e:
                         log.error("Auto-clean crashed for EP %s of %s: %s — keeping it for the next round",
@@ -3006,7 +3065,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                             still_pending.append((skey, ep, stitle, src, title))
                             continue
                         rvideo = await _upload_video_watchdog(
-                            store, skey, ep, data["video_url"], data.get("_video_bytes") or None)
+                            store, skey, ep, data["video_url"], data.get("_video_bytes") or None,
+                            data.get("_alt_url") or "")
                         data.pop("_video_bytes", None)
                     except Exception as e:
                         log.error("Cleanup crashed for EP %s of %s: %s — keeping it for the next round",
