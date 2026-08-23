@@ -508,6 +508,65 @@ def _ensure_videos_bucket(db: Client) -> bool:
         return False
 
 
+_TUS_THRESHOLD = 45 * 1024 * 1024  # plain POST dies at ~50 MB ("EntityTooLarge")
+
+def _tus_upload(remote_path: str, content: bytes, content_type: str) -> str:
+    """Upload via Supabase's TUS/resumable endpoint — chunked (6 MB) and
+    resumable, unlike plain POST which fails with 413 EntityTooLarge above
+    ~50 MB.  NOTE: Supabase free plan still caps uploads at 50 MB per file
+    at the platform level ("Maximum size exceeded") — TUS cannot bypass it."""
+    import base64 as _b64
+    import re as _re
+    import httpx as _httpx
+
+    def _meta(key: str, value: str) -> str:
+        return f"{key} {_b64.b64encode(value.encode()).decode()}"
+
+    create_headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "tus-resumable": "1.0.0",
+        "upload-length": str(len(content)),
+        "upload-metadata": ",".join([
+            _meta("bucketName", STORAGE_BUCKET),
+            _meta("objectName", remote_path),
+            _meta("contentType", content_type),
+            _meta("cacheControl", "3600"),
+        ]),
+        "x-upsert": "true",
+    }
+    r = _httpx.post(f"{SUPABASE_URL}/storage/v1/upload/resumable",
+                    headers=create_headers, timeout=60.0)
+    r.raise_for_status()
+    location = r.headers.get("location") or ""
+    if location.startswith("/"):
+        host = _re.match(r"(https?://[^/]+)", SUPABASE_URL)
+        location = (host.group(1) if host else "") + location
+    if not location:
+        raise RuntimeError(f"TUS creation returned no Location ({r.status_code})")
+
+    offset = 0
+    CHUNK = 6 * 1024 * 1024  # Supabase TUS requires exactly 6 MB chunks
+    while offset < len(content):
+        chunk = content[offset:offset + CHUNK]
+        pr = _httpx.patch(
+            location,
+            content=chunk,
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "tus-resumable": "1.0.0",
+                "upload-offset": str(offset),
+                "Content-Type": "application/offset+octet-stream",
+            },
+            timeout=300.0,
+        )
+        pr.raise_for_status()
+        offset += len(chunk)
+
+    return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{remote_path}"
+
+
 def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, content_type: str, preloaded_bytes: bytes | None = None) -> str:
     """Download *src_url* and upload it to ``{STORAGE_BUCKET}/{series_id}/{prefix}_{ep_num}``.
 
@@ -556,6 +615,10 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{remote_path}"
 
     try:
+        if len(content) >= _TUS_THRESHOLD:
+            log.info("Uploading %s (%.1f MB) via TUS resumable endpoint",
+                     remote_path, len(content) / 1024 / 1024)
+            return _tus_upload(remote_path, content, content_type)
         r = _httpx.post(
             upload_url,
             content=content,
@@ -569,6 +632,10 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
             body = e.response.text[:500]
         except Exception:
             pass
+        # Plain POST dies at ~50 MB ("EntityTooLarge") — fall back to TUS.
+        if e.response.status_code == 413 or "EntityTooLarge" in body:
+            log.warning("POST too large for %s — retrying via TUS", remote_path)
+            return _tus_upload(remote_path, content, content_type)
         log.warning("Storage upload failed for %s (HTTP %s): %s | body: %s",
                      remote_path, e.response.status_code, e, body)
         return ""
