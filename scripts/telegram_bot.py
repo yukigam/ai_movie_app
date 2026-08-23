@@ -510,6 +510,55 @@ def _ensure_videos_bucket(db: Client) -> bool:
 
 _TUS_THRESHOLD = 45 * 1024 * 1024  # plain POST dies at ~50 MB ("EntityTooLarge")
 
+# Supabase free plan rejects ANY upload above 50 MB per file — even TUS.
+# Videos larger than this are transcoded down before upload.
+_COMPRESS_ABOVE = 48 * 1024 * 1024
+
+def _compress_video(content: bytes) -> bytes:
+    """Shrink videos above the Supabase free-plan 50 MB upload cap using the
+    static ffmpeg binary bundled with imageio-ffmpeg (no system install).
+    Returns compressed bytes, or the ORIGINAL bytes when compression is
+    unavailable / fails / doesn't get under the cap."""
+    import tempfile as _tf
+    import subprocess as _sp
+    try:
+        import imageio_ffmpeg as _iff
+        exe = _iff.get_ffmpeg_exe()
+    except Exception as e:
+        log.warning("imageio-ffmpeg unavailable — skipping compression: %s", e)
+        return content
+    try:
+        with _tf.TemporaryDirectory() as td:
+            src = os.path.join(td, "in.mp4")
+            dst = os.path.join(td, "out.mp4")
+            with open(src, "wb") as f:
+                f.write(content)
+            # 720p cap + CRF 27 keeps a vertical short-drama episode well
+            # under 50 MB while staying crisp on phones.
+            p = _sp.run(
+                [exe, "-y", "-i", src,
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+                 "-vf", "scale=min(720\\,iw):-2",
+                 "-c:a", "aac", "-b:a", "96k",
+                 "-movflags", "+faststart",
+                 dst],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=900)
+            if p.returncode != 0 or not os.path.exists(dst):
+                log.warning("ffmpeg compress failed (rc=%s) — uploading original", p.returncode)
+                return content
+            with open(dst, "rb") as f:
+                out = f.read()
+        if not out or len(out) >= _COMPRESS_ABOVE:
+            log.warning("Compression ineffective (%d -> %d bytes) — using original",
+                        len(content), len(out))
+            return content
+        log.info("Compressed video %.1f MB -> %.1f MB",
+                 len(content) / 1e6, len(out) / 1e6)
+        return out
+    except Exception as e:
+        log.warning("Compression crashed: %s — uploading original", e)
+        return content
+
 def _tus_upload(remote_path: str, content: bytes, content_type: str) -> str:
     """Upload via Supabase's TUS/resumable endpoint — chunked (6 MB) and
     resumable, unlike plain POST which fails with 413 EntityTooLarge above
@@ -603,6 +652,10 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
             series_id, prefix, ep_num, len(content), MIN_VIDEO_SIZE,
         )
         return ""
+
+    # Supabase free plan hard-caps uploads at 50 MB/file — transcode first.
+    if "video" in content_type and len(content) > _COMPRESS_ABOVE:
+        content = _compress_video(content)
 
     ext = "mp4" if "video" in content_type else "jpg"
     remote_path = f"{series_id}/{prefix}_{ep_num}.{ext}"
