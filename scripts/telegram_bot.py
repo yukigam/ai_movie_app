@@ -130,7 +130,7 @@ UPLOAD_WATCHDOG = 150.0
 # thumbnail + DB write, one after another) → a 50-episode series crawled
 # for ~30 min.  6 workers ≈ 50 episodes in 3-5 minutes; RAM stays bounded
 # because each worker holds at most ONE video's bytes (~10 MB).
-IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "6"))
+IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "10"))
 
 # Memory soft limit (MB).  Render's free container is killed at ~512 MB RSS;
 # parallel yt-dlp subprocesses + in-RAM video bytes can spike past that and
@@ -999,9 +999,24 @@ def _fetch_video_ytdlp(url: str, custom_title: str | None = None) -> dict | None
     }
 
 
+_TIKWM_LOCK = threading.Lock()
+_TIKWM_LAST = [0.0]
+
+
+def _tikwm_throttle() -> None:
+    """tikwm's free API allows only 1 request/second per IP — serialize calls
+    so parallel workers never trip 'Free Api Limit' rejections."""
+    with _TIKWM_LOCK:
+        wait = 1.05 - (time.time() - _TIKWM_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        _TIKWM_LAST[0] = time.time()
+
+
 def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None:
     """Extract video via tikwm.com free API (no API key needed)."""
     try:
+        _tikwm_throttle()
         resp = _net_retry(
             httpx.post,
             "https://www.tikwm.com/api/",
@@ -1061,20 +1076,32 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
 def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
     """Extract video from a TikTok URL.
     
-    Download chain (pure HTTP — no browser):
-      1. yt-dlp (with cookies) — downloads actual bytes, most reliable  
+    Download chain (pure HTTP — no browser), ordered FASTEST first:
+      1. TikWM API — one POST returns SD+HD CDN URLs (~1s, most reliable)
       2. ssstik.io — free downloader
-      3. TikWM API — free API
+      3. yt-dlp (with cookies) — downloads actual bytes (slow page parsing,
+         kept as fallback)
       4. DIRECT: the video page's own playAddr mp4 URL (rehydration JSON) —
          no third-party processing, works even when every downloader is
          blocked (watermarked, but always available for public videos)
+      5. yt-dlp without cookies — last resort
     
     If *custom_title* is provided it overrides the extracted title.
     Returns a dict with ``_video_bytes`` if the video was actually downloaded.
     """
     has_cookies = os.path.isfile(COOKIES_PATH)
 
-    # 1. yt-dlp (with cookies) — gives bytes directly
+    # 1. TikWM API — fastest and currently the most reliable source.
+    result = _fetch_video_tikwm(url, custom_title)
+    if result and result.get("video_url"):
+        return result
+
+    # 2. ssstik.io
+    result = _fetch_video_ssstik(url, custom_title)
+    if result and result.get("video_url"):
+        return result
+
+    # 3. yt-dlp (with cookies) — gives bytes directly
     if has_cookies:
         result = _fetch_video_ytdlp(url, custom_title)
         if (
@@ -1090,16 +1117,6 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
             return result
         if result:
             log.info("yt-dlp: URL only (no bytes) for %s", url)
-
-    # 2. ssstik.io
-    result = _fetch_video_ssstik(url, custom_title)
-    if result and result.get("video_url"):
-        return result
-
-    # 3. TikWM API
-    result = _fetch_video_tikwm(url, custom_title)
-    if result and result.get("video_url"):
-        return result
 
     # 4. Direct public URL: TikTok's own playAddr mp4, no processing.
     result = _fetch_video_direct(url, custom_title)
@@ -1160,7 +1177,12 @@ def _fetch_video_direct(url: str, custom_title: str | None = None) -> dict | Non
         item = (((scope.get("webapp.video-detail") or {}).get("itemInfo") or {})
                 .get("itemStruct")) or {}
         play = (item.get("video") or {}).get("playAddr") or {}
-        urls = play.get("urlList") or []
+        # playAddr is usually a dict with urlList, but TikTok sometimes
+        # returns the CDN URL as a plain string.
+        if isinstance(play, str):
+            urls = [play] if play.startswith("http") else []
+        else:
+            urls = play.get("urlList") or []
         if not urls or not str(urls[0]).startswith("http"):
             return None
         mp4 = str(urls[0])
@@ -1420,6 +1442,26 @@ class Store:
     def episode_exists(self, sid: str, num: int) -> bool:
         r = self.db.table("episodes").select("id", count="exact").eq("id", f"ep-{sid}-{num}").execute()
         return (r.count or 0) > 0
+
+    def episode_states(self, sid: str) -> dict[int, dict]:
+        """ONE query returning ``{episode_number: {status, video_url}}`` for a
+        whole series — replaces dozens of serial per-episode
+        existence/pending/broken round trips in the import hot path."""
+        cols = "episode_number, status, video_url" if self.has_status else "episode_number, video_url"
+        try:
+            r = self.db.table("episodes").select(cols).eq("series_id", sid).execute()
+            out: dict[int, dict] = {}
+            for row in (r.data or []):
+                if row.get("episode_number") is None:
+                    continue
+                out[int(row["episode_number"])] = {
+                    "status": str(row.get("status") or ""),
+                    "video_url": str(row.get("video_url") or ""),
+                }
+            return out
+        except Exception as e:
+            log.warning("Bulk episode state fetch failed for %s: %s", sid, e)
+            return {}
 
     def _storage_object_size(self, bucket: str, path: str) -> int | None:
         """Return the size in bytes of a storage object, or None if it is missing/error."""
@@ -1897,7 +1939,7 @@ BATCH_LIMIT = 50
 # Parallel source-extraction: episodes are fetched FETCH_CONCURRENCY at a
 # time (the same batching the profile import already uses safely) — a
 # 50-episode series no longer runs source extraction one-by-one.
-FETCH_CONCURRENCY = 4
+FETCH_CONCURRENCY = 8
 
 
 async def _db_call(fn, *args, **kwargs):
@@ -2442,22 +2484,30 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
                 f"(attempt {attempt}/{MAX_FETCH_ATTEMPTS}, timeout {timeout:.0f}s)…",
             )
             still_failed: list[dict] = []
-            for ep in failed:
+
+            async def _retry_one(ep: dict):
+                """One retry attempt for a failed episode (parallel, bounded)."""
                 ep_url = _clean_url(ep["url"])
                 try:
-                    data = await asyncio.wait_for(
+                    return ep, await asyncio.wait_for(
                         asyncio.to_thread(_fetch_video, ep_url),
                         timeout=timeout,
                     )
                 except asyncio.TimeoutError:
-                    still_failed.append(ep)
-                    continue
+                    return ep, None
                 except Exception as e:
                     # Skip-and-log: keep the retry pass alive.
                     log.error("EP %s: retry fetch crashed: %s — keeping it for the next round",
                               ep["episode"], clean_error(e))
-                    still_failed.append(ep)
-                    continue
+                    return ep, None
+
+            rsem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+            async def _retry_bounded(ep: dict):
+                async with rsem:
+                    return await _retry_one(ep)
+
+            for ep, data in await asyncio.gather(*[_retry_bounded(ep) for ep in failed]):
                 if data and data.get("video_url"):
                     parsed = parse_episode_number(data.get("description", ""), data.get("title", ""))
                     data["_ep"] = parsed if parsed is not None else ep["episode"]
@@ -2465,7 +2515,7 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
                         data["title"] = f"{series_title} EP.{data['_ep']}"
                     elif not data.get("title"):
                         data["title"] = f"EP.{data['_ep']}"
-                    data["_page_url"] = ep_url
+                    data["_page_url"] = _clean_url(ep["url"])
                     data.pop("_video_bytes", None)
                     videos.append(data)
                     log.info("Retry OK for EP %s (attempt %d, timeout %.0fs)",
@@ -2853,6 +2903,27 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             next_num += 1
         ordered = known + unknown
 
+        # ── ONE bulk state query instead of ~4 serial network round trips
+        #    per episode (exists + pending + broken checks).  For a 50-episode
+        #    series this saves ~30s of pure latency in the import hot path.
+        states = await _db_call(store.episode_states, skey)
+
+        def _state(ep: int) -> tuple[bool, bool, bool]:
+            """(exists, pending, broken) from the bulk-fetched states."""
+            st = states.get(ep)
+            if st is None:
+                return False, False, False
+            url = st.get("video_url") or ""
+            status = st.get("status") or ""
+            pending = (status == "pending") if store.has_status else (not url)
+            # Legacy non-storage links are doomed when Storage is up — treat
+            # them as broken so they get healed.  Real storage objects are
+            # trusted here (verified at upload time); the cleanup queue
+            # re-checks stragglers off the hot path.
+            broken = bool(url) and getattr(store, "_storage_ready", False) and not (
+                url.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"))
+            return True, pending, broken
+
         # ── Bulk pre-registration (ONE upsert call per series): every
         #    episode that is not already healthy is written into the DB as
         #    PENDING right away, so the series (and its full episode list)
@@ -2861,9 +2932,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
         bulk_rows: list[dict] = []
         for v in ordered:
             ep = v["_ep"]
-            if (await _db_call(store.episode_exists, skey, ep)
-                    and not await _db_call(store.is_episode_pending, skey, ep)
-                    and not await _db_call(store.is_episode_video_broken, skey, ep)):
+            exists, is_pending, is_broken = _state(ep)
+            if exists and not is_pending and not is_broken:
                 continue
             source = v.get("_page_url") or v.get("video_url") or ""
             row = {
@@ -2886,21 +2956,20 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             await _db_call(store.bulk_upsert_pending, skey, bulk_rows)
 
         # ── Work list: episodes that actually need a download+upload ────
-        # (skip/pending/broken checks stay sequential — they are fast DB
-        # reads; the HEAVY part below runs in parallel.)
+        # (decided locally from the bulk states — zero extra round trips;
+        # the HEAVY part below runs in parallel.)
         todo: list[dict] = []
         for v in ordered:
             ep = v["_ep"]
             processed += 1
-            if await _db_call(store.episode_exists, skey, ep):
+            exists, is_pending, is_broken = _state(ep)
+            if exists:
                 if (skey, ep) in pre_registered:
                     pass  # bulk-registered by this import — just upload it
                 # Skip ONLY healthy existing episodes.  Pending (incomplete/
                 # retrying) and broken (0-byte/expired) episodes are never
                 # treated as duplicates — they are re-downloaded & completed.
-                elif (not force
-                      and not await _db_call(store.is_episode_pending, skey, ep)
-                      and not await _db_call(store.is_episode_video_broken, skey, ep)):
+                elif not force and not is_pending and not is_broken:
                     skipped += 1
                     continue
                 else:
