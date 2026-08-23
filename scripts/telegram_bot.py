@@ -582,6 +582,43 @@ def _compress_video(content: bytes) -> bytes:
         log.warning("Compression crashed: %s — uploading original", e)
         return content
 
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+.*: Audio:")
+
+
+def _has_audio_stream(content: bytes) -> bool:
+    """True when *content* (an MP4) contains at least one audio track.
+
+    Some tikwm SD transcodes ship video-only (muted); those must never be
+    uploaded as a drama episode.  Uses the bundled imageio-ffmpeg binary to
+    probe stream info — on any probe failure returns True (never blocks an
+    upload we cannot inspect)."""
+    import subprocess as _sp
+    try:
+        import imageio_ffmpeg as _iff
+        exe = _iff.get_ffmpeg_exe()
+    except Exception:
+        return True
+    tmp = os.path.join(
+        tempfile.gettempdir(), f"_probe_{os.getpid()}_{int(time.time() * 1000)}.mp4"
+    )
+    try:
+        with open(tmp, "wb") as f:
+            f.write(content)
+        p = _sp.run(
+            [exe, "-hide_banner", "-i", tmp],
+            stdout=_sp.DEVNULL, stderr=_sp.PIPE, timeout=60,
+        )
+        return bool(_AUDIO_STREAM_RE.search((p.stderr or b"").decode("utf-8", "replace")))
+    except Exception as e:
+        log.warning("Audio probe failed (assuming OK): %s", e)
+        return True
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _tus_upload(remote_path: str, content: bytes, content_type: str) -> str:
     """Upload via Supabase's TUS/resumable endpoint — chunked (6 MB) and
     resumable, unlike plain POST which fails with 413 EntityTooLarge above
@@ -679,6 +716,32 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
             series_id, prefix, ep_num, len(content), MIN_VIDEO_SIZE,
         )
         return ""
+
+    # Mute-guard: some tikwm SD transcodes are video-only. Reject and swap
+    # to the alternate CDN URL when it carries an audio track.
+    if "video" in content_type and not _has_audio_stream(content):
+        swapped = False
+        if alt_url and alt_url != src_url:
+            log.warning("Primary source has NO audio for %s/%s-%s — trying alternate",
+                        series_id, prefix, ep_num)
+            try:
+                r2 = _httpx.get(alt_url, headers=BROWSER_HEADERS,
+                                follow_redirects=True, timeout=90.0)
+                r2.raise_for_status()
+                if len(r2.content) >= MIN_VIDEO_SIZE and _has_audio_stream(r2.content):
+                    content = r2.content
+                    src_url = alt_url
+                    swapped = True
+                else:
+                    log.warning("Alternate source also unusable for %s/%s-%s",
+                                series_id, prefix, ep_num)
+            except Exception as e:
+                log.warning("Alternate source failed for %s/%s-%s: %s",
+                            series_id, prefix, ep_num, e)
+        if not swapped:
+            log.error("No-audio video rejected for %s/%s-%s — caller retries other sources",
+                      series_id, prefix, ep_num)
+            return ""
 
     # Supabase free plan hard-caps uploads at 50 MB/file — transcode first.
     if "video" in content_type and len(content) > _COMPRESS_ABOVE:
@@ -1014,6 +1077,15 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
     # 1. yt-dlp (with cookies) — gives bytes directly
     if has_cookies:
         result = _fetch_video_ytdlp(url, custom_title)
+        if (
+            result
+            and result.get("_video_bytes")
+            and not _has_audio_stream(result["_video_bytes"])
+        ):
+            # TikTok's own mp4 is occasionally video-only — drop the bytes so
+            # the chain continues to ssstik/tikwm for a properly muxed file.
+            log.warning("yt-dlp bytes have NO audio for %s — trying next source", url)
+            result.pop("_video_bytes", None)
         if result and result.get("_video_bytes"):
             return result
         if result:
