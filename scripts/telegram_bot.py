@@ -2412,6 +2412,34 @@ async def _final_sweep_for_series(series_title: str, last_ep_num: int) -> None:
                     series_title, len(have), last_ep_num)
 
 
+async def _resolve_stub_source(v: dict) -> bool:
+    """Resolve a `_resolve_source` stub IN PLACE: run the full fallback chain
+    against the episode's page URL and fill video_url / thumbnail / duration /
+    description (plus optional _video_bytes for a zero-re-download upload).
+    Returns True when v["video_url"] is now a real media URL."""
+    try:
+        data = await _fetch_episode_source(
+            v.get("_page_url") or v["video_url"], v.get("title"))
+    except Exception as e:
+        log.error("Stub resolve crashed for %s: %s", v.get("title"), clean_error(e))
+        return False
+    if not data or not data.get("video_url"):
+        return False
+    alt = data.pop("_alt_url", "")
+    if alt:
+        v["_alt_url"] = alt
+    v["video_url"] = data["video_url"]
+    if data.get("thumbnail"):
+        v["thumbnail"] = data["thumbnail"]
+    if data.get("duration"):
+        v["duration"] = data["duration"]
+    if data.get("description"):
+        v["description"] = data["description"]
+    if data.get("_video_bytes"):
+        v["_video_bytes"] = data["_video_bytes"]
+    return True
+
+
 async def _background_series_import_impl(msg, episodes: list[dict], series_title: str,
                                          last_ep_num: int | None,
                                          last_ep_url: str | None,
@@ -2420,153 +2448,17 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
                                          topup_username: str = "",
                                          topup_sec_uid: str = "",
                                          topup_drama_id: str = "") -> None:
-    """Detached heavy import: extract every episode's video source
-    (watchdog-guarded), upload to Supabase, verify, and top up anything
-    still missing — runs in the background and never blocks the queue."""
+    """Detached heavy import: every episode is handed to _insert's parallel
+    workers as a `_resolve_source` stub — each worker resolves the CDN source
+    (tikwm → ssstik → yt-dlp → direct) AND uploads in one step, so resolution
+    latency overlaps with upload bandwidth instead of a serialized fetch
+    phase blocking the whole series.  Then verifies and tops up anything
+    still missing.  Runs detached; never blocks the queue."""
     total = len(episodes)
-    await _safe_edit(msg, f"📦 Found {total} episodes in '{series_title or 'unknown series'}'. Extracting video sources…")
-
-    videos = []
-    failed: list[dict] = []
-    for batch_start in range(0, total, FETCH_CONCURRENCY):
-        batch = episodes[batch_start:batch_start + FETCH_CONCURRENCY]
-        end = min(batch_start + FETCH_CONCURRENCY, total)
-        await _safe_edit(
-            msg,
-            f"⏳ Extracting episodes {batch_start + 1}–{end}/{total}…",
-        )
-        # Immediate re-sync with escalating per-attempt timeout; runs
-        # FETCH_CONCURRENCY episodes in parallel so a 50-episode series
-        # no longer extracts one-by-one.
-        results = await asyncio.gather(
-            *[_fetch_episode_source(_clean_url(ep["url"])) for ep in batch]
-        )
-        for ep, data in zip(batch, results):
-            if data and data.get("video_url"):
-                # Real episode number wins — parsed from the video's
-                # description/title text ("Episode 1", "EP1", "Part 3", …).
-                # Falls back to the sidebar position from extraction.
-                parsed = parse_episode_number(data.get("description", ""), data.get("title", ""))
-                data["_ep"] = parsed if parsed is not None else ep["episode"]
-                if series_title:
-                    data["title"] = f"{series_title} EP.{data['_ep']}"
-                elif not data.get("title"):
-                    data["title"] = f"EP.{data['_ep']}"
-                data["_page_url"] = _clean_url(ep["url"])
-                # STREAMING, NOT ACCUMULATING: do not keep this episode's raw
-                # video bytes in the list — 40–50 episodes × 30–60 MB would OOM
-                # the container before _insert even runs.  The upload step
-                # re-fetches the CDN URL once at insert time (quick re-download,
-                # bounded RAM).
-                data.pop("_video_bytes", None)
-                videos.append(data)
-                log.info("Extractor OK for EP %s: %s", ep['episode'], ep["url"])
-            else:
-                log.error("All download methods FAILED for EP %s: %s", ep['episode'], ep["url"])
-                failed.append(ep)
-
-    # ── Strict retry pass: every failed episode is re-fetched up to
-    #    MAX_FETCH_ATTEMPTS times.  Each attempt runs the FULL fallback
-    #    chain (yt-dlp → ssstik → TikWM).  Episodes still
-    #    failing after that are queued for _insert's own retry pass —
-    #    a series is never reported complete while any episode is missing.
-    if failed:
-        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
-            if not failed:
-                break
-            timeout = min(EPISODE_FETCH_TIMEOUT * (2 ** (attempt - 1)), MAX_RETRY_TIMEOUT)
-            failed_nums = ", ".join(f"EP {e['episode']}" for e in failed[:6])
-            if len(failed) > 6:
-                failed_nums += "…"
-            await _safe_edit(
-                msg,
-                f"🔄 Retrying {len(failed)} episode(s): {failed_nums} "
-                f"(attempt {attempt}/{MAX_FETCH_ATTEMPTS}, timeout {timeout:.0f}s)…",
-            )
-            still_failed: list[dict] = []
-
-            async def _retry_one(ep: dict):
-                """One retry attempt for a failed episode (parallel, bounded)."""
-                ep_url = _clean_url(ep["url"])
-                try:
-                    return ep, await asyncio.wait_for(
-                        asyncio.to_thread(_fetch_video, ep_url),
-                        timeout=timeout,
-                    )
-                except asyncio.TimeoutError:
-                    return ep, None
-                except Exception as e:
-                    # Skip-and-log: keep the retry pass alive.
-                    log.error("EP %s: retry fetch crashed: %s — keeping it for the next round",
-                              ep["episode"], clean_error(e))
-                    return ep, None
-
-            rsem = asyncio.Semaphore(FETCH_CONCURRENCY)
-
-            async def _retry_bounded(ep: dict):
-                async with rsem:
-                    return await _retry_one(ep)
-
-            for ep, data in await asyncio.gather(*[_retry_bounded(ep) for ep in failed]):
-                if data and data.get("video_url"):
-                    parsed = parse_episode_number(data.get("description", ""), data.get("title", ""))
-                    data["_ep"] = parsed if parsed is not None else ep["episode"]
-                    if series_title:
-                        data["title"] = f"{series_title} EP.{data['_ep']}"
-                    elif not data.get("title"):
-                        data["title"] = f"EP.{data['_ep']}"
-                    data["_page_url"] = _clean_url(ep["url"])
-                    data.pop("_video_bytes", None)
-                    videos.append(data)
-                    log.info("Retry OK for EP %s (attempt %d, timeout %.0fs)",
-                             ep["episode"], attempt, timeout)
-                else:
-                    still_failed.append(ep)
-            failed = still_failed
-            if failed:
-                await asyncio.sleep(1.0)
-
-    # Queue every still-failed episode for _insert's strict retry pass,
-    # which will re-attempt downloads until MAX_UPLOAD_ATTEMPTS is reached.
-    for ep in failed:
-        log.warning("EP %s still failed after %d attempts — queued for upload retry pass",
-                    ep["episode"], MAX_FETCH_ATTEMPTS)
-        stub = {
-            "title": f"{series_title} EP.{ep['episode']}" if series_title else f"EP.{ep['episode']}",
-            "video_url": ep["url"],
-            "_page_url": ep["url"],
-            "_ep": ep["episode"],
-            "description": "",
-            "thumbnail": "",
-            "duration": 1,
-        }
-        videos.append(stub)
-
-    # ── Last-episode guarantee: if the expected FINAL episode (last tab's
-    #    end, e.g. EP 60) never made it into the extracted list, queue the
-    #    currently-open page's video so _insert's strict retry pass
-    #    downloads it automatically.
-    if last_ep_num and not any(v.get("_ep") == last_ep_num for v in videos):
-        fill_url = last_ep_url
-        if fill_url:
-            log.warning("Final episode EP %d missing from extraction — queuing auto-fill from %s",
-                        last_ep_num, fill_url)
-            await _safe_edit(msg, f"⚠️ Сүүлийн анги (EP {last_ep_num}) дутуу байна — автоматаар нөхөж байна…")
-            videos.append({
-                "title": f"{series_title} EP.{last_ep_num}" if series_title else f"EP.{last_ep_num}",
-                "video_url": fill_url,
-                "_page_url": fill_url,
-                "_ep": last_ep_num,
-                "description": "",
-                "thumbnail": "",
-                "duration": 1,
-            })
 
     # ── Completeness gate + auto-refill: if the extraction came back short
     #    of the official total (e.g. only 2 of 50), re-extract the series
-    #    ONCE and merge the missing episode numbers in — the import below
-    #    then fills 3..N in the same run and the bot can never report
-    #    "everything already present" while the series is incomplete.
+    #    ONCE and merge the missing episode numbers in.
     if last_ep_num and len(episodes) < last_ep_num:
         seed = last_ep_url or (episodes[0]["url"] if episodes else None)
         if seed:
@@ -2595,6 +2487,34 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
             except Exception as e:
                 log.warning("Completeness re-extraction failed: %s", clean_error(e))
 
+    # ── Last-episode guarantee: if the expected FINAL episode never made it
+    #    into the extracted list, queue the currently-open page's video so
+    #    the import downloads it automatically.
+    if last_ep_num and not any(int(e.get("episode") or 0) == last_ep_num for e in episodes):
+        if last_ep_url:
+            log.warning("Final episode EP %d missing from extraction — queuing auto-fill from %s",
+                        last_ep_num, last_ep_url)
+            await _safe_edit(msg, f"⚠️ Сүүлийн анги (EP {last_ep_num}) дутуу байна — автоматаар нөхөж байна…")
+            episodes.append({"url": last_ep_url, "episode": last_ep_num})
+            total = len(episodes)
+
+    # ── UNIFIED PIPELINE: one parallel pool does resolve + download +
+    #    upload per episode.  No separate fetch phase, no serial bottleneck.
+    videos = []
+    for ep in episodes:
+        u = _clean_url(ep["url"])
+        n = int(ep["episode"])
+        videos.append({
+            "title": f"{series_title} EP.{n}" if series_title else f"EP.{n}",
+            "video_url": u,           # TikTok page URL — resolved in-worker
+            "_page_url": u,
+            "_resolve_source": True,  # tells _do_upload to resolve first
+            "_ep": n,
+            "description": "",
+            "thumbnail": "",
+            "duration": 1,
+        })
+
     if not videos:
         await _safe_edit(msg, "❌ Could not extract any video sources from any of the %d episodes." % total)
         return
@@ -2607,8 +2527,7 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
 
     await _safe_edit(
         msg,
-        f"✅ All {len(videos)}/{total} episodes extracted.\n"
-        f"⬆️ Uploading to Supabase…"
+        f"⚡ {len(videos)} ангийг зэрэгцүүлэн татаж байршуулж байна…"
     )
     # "Import complete" is only sent by _insert() after every episode has
     # been uploaded to Supabase.
@@ -2994,6 +2913,17 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             async def _do_upload() -> None:
                 nonlocal inserted
                 try:
+                    # Unified pipeline: this episode arrived as a stub whose
+                    # video_url is still the TikTok page URL — resolve the real
+                    # CDN source right here inside the worker, so resolution
+                    # latency overlaps with other uploads instead of running
+                    # as a separate serialized phase.
+                    if v.pop("_resolve_source", False):
+                        if not await _resolve_stub_source(v):
+                            log.warning("Source resolve failed for EP %s of %s — queued for retry",
+                                        ep, stitle)
+                            failed.append((skey, ep, stitle, v))
+                            return
                     preloaded = v.get("_video_bytes") or None
                     video_url = await _upload_video_watchdog(
                         store, skey, ep, v["video_url"], preloaded, v.get("_alt_url") or "")
@@ -3240,6 +3170,19 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     if db_total_known:
         (skey, _), = groups.items()
         db_have = await _healthy_db_episodes(store, skey, official_total)
+        # ── Completeness console report: explicitly verify EP 1..N all
+        #    present and print any missing numbers.
+        missing_eps = [n for n in range(1, official_total + 1)
+                       if n not in db_have]
+        if missing_eps:
+            shown = str(missing_eps[:25]).rstrip("]")
+            suffix = "…" if len(missing_eps) > 25 else ""
+            log.warning("❌ COMPLETENESS %s: %d/%d — MISSING EPs: %s%s",
+                        stitle, len(db_have), official_total, shown, suffix)
+        else:
+            log.info("✅ COMPLETENESS %s: ALL %d/%d episodes present "
+                     "(EP 1..%d, no gaps)", stitle, official_total,
+                     official_total, official_total)
         log.info("DB completeness for %s: %d/%d official episodes healthy",
                  skey, len(db_have), official_total)
 
