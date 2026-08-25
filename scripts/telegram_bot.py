@@ -1966,6 +1966,41 @@ async def _db_call(fn, *args, **kwargs):
         raise
 
 
+async def _rehost_poster(url: str, skey: str) -> str:
+    """TikTok CDN poster URLs are SIGNED and expire (~1 day), leaving every
+    series poster broken with http 403 after that.  Download the image once
+    and re-host it on Supabase Storage — that public URL never expires.
+    Returns the original URL unchanged when it's already ours or on failure."""
+    def _sync(u: str) -> str:
+        if not u or u.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"):
+            return u
+        try:
+            img = httpx.get(u, timeout=30, follow_redirects=True)
+            ctype = img.headers.get("content-type", "image/jpeg")
+            if (img.status_code != 200 or len(img.content) < 1000
+                    or not ctype.startswith("image")):
+                return u
+            ext = "png" if "png" in ctype else "jpg"
+            path = f"{skey}/poster.{ext}"
+            r = httpx.post(
+                f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{path}",
+                headers={"apikey": SUPABASE_KEY or "",
+                         "Authorization": f"Bearer {SUPABASE_KEY or ''}",
+                         "Content-Type": ctype, "x-upsert": "true"},
+                content=img.content, timeout=60)
+            if r.status_code in (200, 201):
+                log.info("Poster re-hosted to Storage for %s (%dKB)",
+                         skey, len(img.content) // 1024)
+                return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
+            log.warning("Poster re-host failed (%s): %s",
+                        r.status_code, r.text[:120])
+        except Exception as e:
+            log.warning("Poster re-host crashed for %s: %s", skey, clean_error(e))
+        return u
+
+    return await asyncio.to_thread(_sync, url)
+
+
 async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
                                  preloaded_bytes: bytes | None = None,
                                  alt_url: str = "") -> str:
@@ -2179,6 +2214,9 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     total = len(episodes)
     skey = slug_id(series_title)
     store = Store()
+    if series_cover:
+        # TikTok CDN cover links expire — re-host so the poster never 403s.
+        series_cover = await _rehost_poster(series_cover, skey)
     await _db_call(store.upsert_series, skey, series_title, DEFAULT_GENRE,
                     series_title, series_cover or "")
 
@@ -2827,6 +2865,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             f"📦 Series [{idx}/{total_groups}]: *{stitle}*",
             parse_mode="Markdown",
         )
+        # Same expiry trap as the official cover — re-host the fallback.
+        thumb = await _rehost_poster(thumb, skey)
         await _db_call(store.upsert_series, skey, stitle, DEFAULT_GENRE, desc, thumb)
         created += 1
 
