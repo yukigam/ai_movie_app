@@ -25,6 +25,12 @@ from dotenv import load_dotenv
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(ROOT, ".env"))
 
+# Local machines have far more headroom than Render's 512 MB container —
+# crank the parallel pools BEFORE importing telegram_bot (it reads these
+# at module load).  Override via env if needed.
+os.environ.setdefault("IMPORT_WORKERS", "16")
+os.environ.setdefault("FETCH_CONCURRENCY", "12")
+
 import telegram_bot as bot                # noqa: E402
 from tiktok_series import extract_series  # noqa: E402
 

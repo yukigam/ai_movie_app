@@ -1073,7 +1073,8 @@ def _fetch_video_tikwm(url: str, custom_title: str | None = None) -> dict | None
         return None
 
 
-def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
+def _fetch_video(url: str, custom_title: str | None = None,
+                 skip_tikwm: bool = False) -> dict | None:
     """Extract video from a TikTok URL.
     
     Download chain (pure HTTP — no browser), ordered FASTEST first:
@@ -1086,15 +1087,20 @@ def _fetch_video(url: str, custom_title: str | None = None) -> dict | None:
          blocked (watermarked, but always available for public videos)
       5. yt-dlp without cookies — last resort
     
+    With *skip_tikwm* the chain starts at ssstik instead — used by the
+    round-robin scheduler so parallel workers don't all pile up on tikwm's
+    1 request/second per-IP limit (which would serialize the whole series).
+    
     If *custom_title* is provided it overrides the extracted title.
     Returns a dict with ``_video_bytes`` if the video was actually downloaded.
     """
     has_cookies = os.path.isfile(COOKIES_PATH)
 
     # 1. TikWM API — fastest and currently the most reliable source.
-    result = _fetch_video_tikwm(url, custom_title)
-    if result and result.get("video_url"):
-        return result
+    if not skip_tikwm:
+        result = _fetch_video_tikwm(url, custom_title)
+        if result and result.get("video_url"):
+            return result
 
     # 2. ssstik.io
     result = _fetch_video_ssstik(url, custom_title)
@@ -1939,7 +1945,7 @@ BATCH_LIMIT = 50
 # Parallel source-extraction: episodes are fetched FETCH_CONCURRENCY at a
 # time (the same batching the profile import already uses safely) — a
 # 50-episode series no longer runs source extraction one-by-one.
-FETCH_CONCURRENCY = 8
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "8"))
 
 
 async def _db_call(fn, *args, **kwargs):
@@ -1993,7 +1999,8 @@ async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
     return url
 
 
-async def _fetch_episode_source(url: str, custom_title: str | None = None) -> dict | None:
+async def _fetch_episode_source(url: str, custom_title: str | None = None,
+                                skip_tikwm: bool = False) -> dict | None:
     """Watchdog-guarded source fetch for one episode.
 
     If the fetch shows no progress within FETCH_WATCHDOG seconds, the
@@ -2006,12 +2013,12 @@ async def _fetch_episode_source(url: str, custom_title: str | None = None) -> di
         log.info("[mem] pressure before fetch %s… — serializing", url[-30:])
         async with _MEMORY_LOCK:
             return await asyncio.wait_for(
-                asyncio.to_thread(_fetch_video, url, custom_title),
+                asyncio.to_thread(_fetch_video, url, custom_title, skip_tikwm),
                 timeout=FETCH_WATCHDOG,
             )
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_fetch_video, url, custom_title),
+            asyncio.to_thread(_fetch_video, url, custom_title, skip_tikwm),
             timeout=FETCH_WATCHDOG,
         )
     except asyncio.TimeoutError:
@@ -2238,34 +2245,47 @@ async def _complete_series_pending_rows(skey: str, stitle: str,
                                         rows: list[dict]) -> None:
     """Background completion of one series' pending rows (startup sweep).
     Each pending episode is fetched (watchdog), uploaded (watchdog) and
-    upserted as healthy — never blocks the queue."""
+    upserted as healthy — in a bounded PARALLEL pool so healing a 100-episode
+    series takes minutes instead of an hour.  Never blocks the queue."""
     store = Store()
     done = 0
-    for r in rows:
-        try:
-            ep = int(r.get("episode_number") or 0)
-            src = str(r.get("source_url") or "") or str(r.get("description") or "")
-            if not ep or not src.startswith("http"):
-                continue
-            data = await _fetch_episode_source(src, f"{stitle} EP.{ep}")
-            if not data or not data.get("video_url"):
-                continue
-            rvideo = await _upload_video_watchdog(
-                store, skey, ep, data["video_url"], data.get("_video_bytes") or None,
-                data.get("_alt_url") or "")
-            data.pop("_video_bytes", None)
-            if not rvideo:
-                continue
-            data["video_url"] = rvideo
-            data["title"] = f"{stitle} EP.{ep}"
-            data["_page_url"] = src
-            data["thumbnail"] = data.get("thumbnail") or ""
-            await _db_call(store.upsert_episode, skey, ep, data,
-                           ep <= DEFAULT_FREE_FIRST)
-            done += 1
-        except Exception as e:
-            log.warning("Startup sweep: EP %s of %s failed: %s",
-                        r.get("episode_number"), stitle, clean_error(e))
+    sem = asyncio.Semaphore(max(2, IMPORT_WORKERS))
+
+    async def _heal_one(r: dict) -> bool:
+        ep = int(r.get("episode_number") or 0)
+        src = str(r.get("source_url") or "") or str(r.get("description") or "")
+        if not ep or not src.startswith("http"):
+            return False
+        async with sem:
+            try:
+                # Round-robin off tikwm for odd rows — same reason as the
+                # import pipeline (1 req/s per-IP cap would serialize us).
+                data = await _fetch_episode_source(
+                    src, f"{stitle} EP.{ep}",
+                    skip_tikwm=(ep % 2 == 1))
+                if not data or not data.get("video_url"):
+                    return False
+                rvideo = await _upload_video_watchdog(
+                    store, skey, ep, data["video_url"],
+                    data.get("_video_bytes") or None,
+                    data.get("_alt_url") or "")
+                data.pop("_video_bytes", None)
+                if not rvideo:
+                    return False
+                data["video_url"] = rvideo
+                data["title"] = f"{stitle} EP.{ep}"
+                data["_page_url"] = src
+                data["thumbnail"] = data.get("thumbnail") or ""
+                await _db_call(store.upsert_episode, skey, ep, data,
+                               ep <= DEFAULT_FREE_FIRST)
+                return True
+            except Exception as e:
+                log.warning("Startup sweep: EP %s of %s failed: %s",
+                            ep, stitle, clean_error(e))
+                return False
+
+    results = await asyncio.gather(*[_heal_one(r) for r in rows])
+    done = sum(1 for ok in results if ok)
     if done:
         log.info("Startup sweep: completed %d pending episodes of %s", done, stitle)
 
@@ -2419,7 +2439,9 @@ async def _resolve_stub_source(v: dict) -> bool:
     Returns True when v["video_url"] is now a real media URL."""
     try:
         data = await _fetch_episode_source(
-            v.get("_page_url") or v["video_url"], v.get("title"))
+            v.get("_page_url") or v["video_url"], v.get("title"),
+            skip_tikwm=bool(v.get("_skip_tikwm")),
+        )
     except Exception as e:
         log.error("Stub resolve crashed for %s: %s", v.get("title"), clean_error(e))
         return False
@@ -2500,8 +2522,15 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
 
     # ── UNIFIED PIPELINE: one parallel pool does resolve + download +
     #    upload per episode.  No separate fetch phase, no serial bottleneck.
+    #    Round-robin provider split: every other episode skips tikwm and
+    #    starts at ssstik/yt-dlp instead — tikwm's free API only allows
+    #    1 request/second per IP, so sending ALL episodes there would
+    #    serialize the whole series (~1s × N).  With a 50/50 split the
+    #    tikwm half runs at 1/s while the other half downloads in true
+    #    parallel, roughly halving wall-clock time (failures fall through
+    #    to the full chain anyway).
     videos = []
-    for ep in episodes:
+    for idx, ep in enumerate(episodes):
         u = _clean_url(ep["url"])
         n = int(ep["episode"])
         videos.append({
@@ -2509,6 +2538,7 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
             "video_url": u,           # TikTok page URL — resolved in-worker
             "_page_url": u,
             "_resolve_source": True,  # tells _do_upload to resolve first
+            "_skip_tikwm": idx % 2 == 1,
             "_ep": n,
             "description": "",
             "thumbnail": "",
@@ -2986,7 +3016,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
 
     # ── Strict retry pass: re-download + re-upload every failed episode,
     #    up to MAX_UPLOAD_ATTEMPTS rounds.  Each attempt runs the full
-    #    fallback chain (yt-dlp → ssstik → TikWM).
+    #    fallback chain (yt-dlp → ssstik → TikWM) in a bounded PARALLEL
+    #    pool — a serial loop would spend minutes per failed episode.
     if failed:
         for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
             if not failed:
@@ -2999,30 +3030,43 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                 f"🔄 Retry {attempt}/{MAX_UPLOAD_ATTEMPTS} — re-downloading: {failed_nums}…",
             )
             still: list[tuple] = []
-            for fkey, fep, ftitle, fv in failed:
-                try:
-                    data = await _fetch_episode_source(
-                        fv.get("_page_url") or fv["video_url"], fv.get("title"))
-                    if not data:
-                        still.append((fkey, fep, ftitle, fv))
-                        continue
-                    rvideo = await _upload_video_watchdog(
-                        store, fkey, fep, data["video_url"], data.get("_video_bytes") or None,
-                        data.get("_alt_url") or "")
-                    data.pop("_video_bytes", None)
-                except Exception as e:
-                    log.error("Retry crashed for EP %s of %s: %s — keeping it for the next round",
-                              fep, ftitle, clean_error(e))
-                    still.append((fkey, fep, ftitle, fv))
-                    continue
-                if rvideo:
-                    fv["video_url"] = rvideo
-                    await _db_call(store.upsert_episode, fkey, fep, fv, fep <= DEFAULT_FREE_FIRST)
-                    inserted += 1
-                    inserted_eps.append((fkey, fep, ftitle, fv))
-                    log.info("Retry OK for EP %s of %s (round %d)", fep, ftitle, attempt)
-                else:
-                    still.append((fkey, fep, ftitle, fv))
+            rsem = asyncio.Semaphore(max(2, IMPORT_WORKERS))
+            lock = asyncio.Lock()
+
+            async def _retry_one(fkey: str, fep: int, ftitle: str, fv: dict) -> None:
+                nonlocal inserted
+                async with rsem:
+                    try:
+                        data = await _fetch_episode_source(
+                            fv.get("_page_url") or fv["video_url"], fv.get("title"))
+                        if not data:
+                            async with lock:
+                                still.append((fkey, fep, ftitle, fv))
+                            return
+                        rvideo = await _upload_video_watchdog(
+                            store, fkey, fep, data["video_url"],
+                            data.get("_video_bytes") or None,
+                            data.get("_alt_url") or "")
+                        data.pop("_video_bytes", None)
+                    except Exception as e:
+                        log.error("Retry crashed for EP %s of %s: %s — keeping it for the next round",
+                                  fep, ftitle, clean_error(e))
+                        async with lock:
+                            still.append((fkey, fep, ftitle, fv))
+                        return
+                    if rvideo:
+                        fv["video_url"] = rvideo
+                        await _db_call(store.upsert_episode, fkey, fep, fv,
+                                       fep <= DEFAULT_FREE_FIRST)
+                        inserted += 1
+                        inserted_eps.append((fkey, fep, ftitle, fv))
+                        log.info("Retry OK for EP %s of %s (round %d)", fep, ftitle, attempt)
+                    else:
+                        async with lock:
+                            still.append((fkey, fep, ftitle, fv))
+
+            await asyncio.gather(
+                *[_retry_one(k, e, t, v) for k, e, t, v in failed])
             failed = still
             if failed:
                 await asyncio.sleep(3)
