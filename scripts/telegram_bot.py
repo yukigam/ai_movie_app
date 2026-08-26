@@ -1969,8 +1969,10 @@ async def _db_call(fn, *args, **kwargs):
 async def _rehost_poster(url: str, skey: str) -> str:
     """TikTok CDN poster URLs are SIGNED and expire (~1 day), leaving every
     series poster broken with http 403 after that.  Download the image once
-    and re-host it on Supabase Storage — that public URL never expires.
-    Returns the original URL unchanged when it's already ours or on failure."""
+    and re-host it on Supabase Storage under a UNIQUE versioned filename —
+    re-using the same object path lets the CDN serve a STALE cached copy
+    (cacheControl=3600) even after a newer image is uploaded.  Returns the
+    original URL unchanged when it's already ours or on failure."""
     def _sync(u: str) -> str:
         if not u or u.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"):
             return u
@@ -1981,7 +1983,7 @@ async def _rehost_poster(url: str, skey: str) -> str:
                     or not ctype.startswith("image")):
                 return u
             ext = "png" if "png" in ctype else "jpg"
-            path = f"{skey}/poster.{ext}"
+            path = f"{skey}/poster_{int(time.time())}.{ext}"
             r = httpx.post(
                 f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{path}",
                 headers={"apikey": SUPABASE_KEY or "",
@@ -1999,6 +2001,18 @@ async def _rehost_poster(url: str, skey: str) -> str:
         return u
 
     return await asyncio.to_thread(_sync, url)
+
+
+async def _existing_poster(store, skey: str) -> str:
+    """Current permanent (Storage-hosted) poster URL of a series, if any."""
+    try:
+        resp = (store.db.table("series").select("poster_url")
+                .eq("id", skey).limit(1).execute())
+        url = str(((resp.data or [{}])[0]).get("poster_url") or "")
+        return url if url.startswith(f"{SUPABASE_URL}/storage/v1/object/public/") else ""
+    except Exception as e:
+        log.warning("Existing-poster lookup failed for %s: %s", skey, clean_error(e))
+        return ""
 
 
 async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
@@ -2217,6 +2231,9 @@ async def _playlist_from_episodes(episodes: list[dict], msg, series_title: str |
     if series_cover:
         # TikTok CDN cover links expire — re-host so the poster never 403s.
         series_cover = await _rehost_poster(series_cover, skey)
+    else:
+        # Never blank an already-stored permanent poster on a re-import.
+        series_cover = await _existing_poster(store, skey)
     await _db_call(store.upsert_series, skey, series_title, DEFAULT_GENRE,
                     series_title, series_cover or "")
 
@@ -2844,10 +2861,14 @@ async def _insert(msg, videos: list[dict], force: bool = False,
                     v["_series"] = stitle
         touched_titles[skey] = stitle
 
-        # ── Poster selection: the series' OFFICIAL cover (extraction meta)
-        #    wins; otherwise Episode 1's cover ONLY — never a random
-        #    episode's thumbnail.
+        # ── Poster selection, strictest first:
+        #    1. The series' OFFICIAL cover from extraction meta (_cover)
+        #    2. An ALREADY-STORED permanent poster (never downgrade it to a
+        #       video thumbnail on a re-import/top-up!)
+        #    3. Episode 1's cover ONLY — never a random episode's thumbnail.
         thumb = next((v.get("_cover") for v in vlist if v.get("_cover")), "")
+        if not thumb:
+            thumb = await _existing_poster(store, skey)
         if not thumb:
             ep1 = next((v for v in vlist if v.get("_ep") == 1), None)
             if ep1 and ep1.get("thumbnail"):
