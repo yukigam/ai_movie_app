@@ -1402,6 +1402,10 @@ def _fetch_entries(username: str) -> list[dict]:
 
 # ── Supabase ────────────────────────────────────────────────────────────────
 
+# Last episode-count sync timestamp per series id (throttles recount churn).
+_COUNT_SYNC_AT: dict[str, float] = {}
+
+
 class Store:
     def __init__(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1531,6 +1535,53 @@ class Store:
         """True when the existing episode's video is 0-byte, expired or unreadable."""
         return self.is_video_url_broken(self.get_episode_video_url(sid, num))
 
+    def bulk_video_sizes(self, sid: str) -> dict[int, int]:
+        """ONE storage list call for the whole series folder →
+        {episode_number: size_in_bytes}.  Replaces N×2 per-episode HEAD/list
+        round trips during health checks (~2s saved PER EPISODE on imports)."""
+        import httpx as _httpx
+        out: dict[int, int] = {}
+        try:
+            r = _httpx.post(
+                f"{SUPABASE_URL}/storage/v1/object/list/{STORAGE_BUCKET}",
+                json={"prefix": f"{sid}/", "limit": 1000, "offset": 0},
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                for obj in r.json():
+                    m = re.match(r"video_\d+\.", str(obj.get("name") or ""))
+                    if not m:
+                        continue
+                    num_m = re.search(r"video_(\d+)", str(obj.get("name")))
+                    if num_m:
+                        out[int(num_m.group(1))] = int(
+                            (obj.get("metadata") or {}).get("size") or 0)
+        except Exception as e:
+            log.warning("Bulk storage size fetch failed for %s: %s", sid, e)
+        return out
+
+    def sync_episode_count(self, sid: str, force: bool = False) -> None:
+        """Refresh series.episode_count — THROTTLED to once per 20s per series.
+        The old code recounted on EVERY single episode upsert (61 episodes =
+        61 full-table counts + 61 PATCHes ≈ 1-2 min of pure waste per import).
+        Call with force=True once at the end of an import for the final value."""
+        now = time.time()
+        if not force and now - _COUNT_SYNC_AT.get(sid, 0.0) < 20.0:
+            return
+        _COUNT_SYNC_AT[sid] = now
+        try:
+            cnt = self.db.table("episodes").select("id", count="exact") \
+                .eq("series_id", sid).execute().count or 0
+            self.db.table("series").update({"episode_count": cnt}) \
+                .eq("id", sid).execute()
+        except Exception as e:
+            log.warning("Episode-count sync failed for %s: %s", sid, e)
+
     def is_episode_pending(self, sid: str, num: int) -> bool:
         """True when the episode row exists in the DB but is not playable yet
         (status='pending' / empty video_url).  Pending episodes are NEVER
@@ -1579,8 +1630,7 @@ class Store:
             row["source_url"] = source
         try:
             self.db.table("episodes").upsert(row, on_conflict="id").execute()
-            cnt = self.db.table("episodes").select("id", count="exact").eq("series_id", sid).execute().count or 0
-            self.db.table("series").update({"episode_count": cnt}).eq("id", sid).execute()
+            self.sync_episode_count(sid)
         except Exception as e:
             log.error("Marking EP %s of %s as pending failed: %s", num, sid, e)
 
@@ -1592,8 +1642,7 @@ class Store:
             return
         try:
             self.db.table("episodes").upsert(rows, on_conflict="id").execute()
-            cnt = self.db.table("episodes").select("id", count="exact").eq("series_id", sid).execute().count or 0
-            self.db.table("series").update({"episode_count": cnt}).eq("id", sid).execute()
+            self.sync_episode_count(sid)
         except Exception as e:
             log.error("Bulk pending upsert for %s failed (%d rows): %s", sid, len(rows), e)
             for row in rows:
@@ -1632,8 +1681,7 @@ class Store:
             row["status"] = "ok"
             row["source_url"] = data.get("_page_url") or data.get("video_url") or ""
         self.db.table("episodes").upsert(row, on_conflict="id").execute()
-        cnt = self.db.table("episodes").select("id", count="exact").eq("series_id", sid).execute().count or 0
-        self.db.table("series").update({"episode_count": cnt}).eq("id", sid).execute()
+        self.sync_episode_count(sid)
 
 
 # ── Sequential job queue ─────────────────────────────────────────────────────
@@ -2342,6 +2390,7 @@ async def _complete_series_pending_rows(skey: str, stitle: str,
     results = await asyncio.gather(*[_heal_one(r) for r in rows])
     done = sum(1 for ok in results if ok)
     if done:
+        await _db_call(store.sync_episode_count, skey, True)  # final count
         log.info("Startup sweep: completed %d pending episodes of %s", done, stitle)
 
 
@@ -2772,23 +2821,36 @@ async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = No
     """Distinct episode numbers 1..limit that are FULLY playable in the DB
     (real video_url, not pending, storage object healthy).  This is the
     single source of truth for the "гүйцсэн үү?" check — never a guess.
-    Every DB/storage call is watchdog-guarded (never blocks the loop)."""
+
+    Storage health is verified with ONE bulk list call for the whole series
+    folder instead of 2 HTTP round trips per episode — a 100-episode series
+    health check drops from ~4 min to ~2 s."""
     have: set[int] = set()
     try:
         rows = await _db_call(store.get_series_episodes, skey)
         if rows is None:
             return have
+        sizes = await _db_call(store.bulk_video_sizes, skey)
+        bulk_ok = sizes is not None and len(sizes) > 0
         for row in rows:
             ep = int(row.get("episode_number") or 0)
             if not ep or (limit and ep > limit):
                 continue
-            if not str(row.get("video_url") or ""):
+            url = str(row.get("video_url") or "")
+            if not url:
                 continue
             if store.has_status and str(row.get("status") or "") == "pending":
                 continue
-            broken = await _db_call(store.is_episode_video_broken, skey, ep)
-            if broken:
-                continue
+            if url.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"):
+                # Permanent storage link → healthy iff the object exists with
+                # real bytes (from the single bulk listing above).
+                if bulk_ok:
+                    if sizes.get(ep, 0) <= MIN_VIDEO_SIZE:
+                        continue
+                # If the bulk listing failed entirely, trust the DB row
+                # rather than failing every episode.
+            elif store._storage_ready:
+                continue  # legacy CDN link + storage available → broken
             have.add(ep)
     except Exception as e:
         log.warning("Healthy-episode query for %s failed: %s", skey, clean_error(e))
@@ -3135,23 +3197,23 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     # ── Auto-clean before the success message: verify every inserted
     #    episode's storage object is healthy (non-zero size, readable).
     #    Broken ones are re-downloaded & re-uploaded automatically.
+    #    ONE bulk storage listing per series replaces the old 2-HTTP-calls-
+    #    per-episode HEAD storm (~2 min saved on a 60-episode import).
     broken_eps: list[tuple] = []
     if inserted_eps:
         await _safe_edit(msg, "🔍 Шалгаж байна: upload-д орсон видеонууд…")
-        # Parallel health check — one storage HEAD per episode, N at a time.
-        bsem = asyncio.Semaphore(max(1, IMPORT_WORKERS))
-
-        async def _check_broken(entry: tuple) -> tuple | None:
-            bk, bep, bt, bv = entry
-            async with bsem:
-                broken = await _db_call(store.is_episode_video_broken, bk, bep)
-            if broken:
+        sizes_by_key: dict[str, dict[int, int]] = {}
+        for bk in {e[0] for e in inserted_eps}:
+            sizes_by_key[bk] = await _db_call(store.bulk_video_sizes, bk) or {}
+        broken_eps = []
+        for entry in inserted_eps:
+            bk, bep, bt, _bv = entry
+            sizes = sizes_by_key.get(bk)
+            if not sizes:
+                continue  # listing unavailable → trust this run's uploads
+            if sizes.get(bep, 0) <= MIN_VIDEO_SIZE:
                 log.warning("Auto-clean: EP %s of %s storage object broken — re-importing", bep, bt)
-                return entry
-            return None
-
-        results = await asyncio.gather(*[_check_broken(e) for e in inserted_eps])
-        broken_eps = [r for r in results if r is not None]
+                broken_eps.append(entry)
         if broken_eps:
             for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
                 if not broken_eps:
@@ -3274,6 +3336,7 @@ async def _insert(msg, videos: list[dict], force: bool = False,
     db_total_known = bool(official_total) and len(groups) == 1
     if db_total_known:
         (skey, _), = groups.items()
+        await _db_call(store.sync_episode_count, skey, True)  # final count
         db_have = await _healthy_db_episodes(store, skey, official_total)
         # ── Completeness console report: explicitly verify EP 1..N all
         #    present and print any missing numbers.
