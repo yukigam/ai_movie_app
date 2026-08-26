@@ -44,8 +44,17 @@ async def main() -> int:
 
     t0 = time.time()
     print(f"[1/4] Extracting series from {args.url} …")
-    episodes = await asyncio.to_thread(
-        extract_series, args.url, lambda s: print("   .", s[:100]))
+    episodes: list[dict] = []
+    for attempt in range(1, 6):
+        episodes = await asyncio.to_thread(
+            extract_series, args.url, lambda s: print("   .", s[:100]))
+        if len(episodes) >= 2 or any("_meta" in e for e in episodes):
+            break
+        if attempt < 5:
+            wait = 20 * attempt
+            print(f"   ⚠️ TikTok gave a thin-shell page (0 episodes) — "
+                  f"retrying in {wait}s (attempt {attempt}/5)…")
+            await asyncio.sleep(wait)
     meta = next((e["_meta"] for e in episodes if "_meta" in e), {})
     title = meta.get("series_title") or "Unknown"
     last_ep = meta.get("last_ep_num")

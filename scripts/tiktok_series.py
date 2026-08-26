@@ -137,7 +137,7 @@ def _load_page(url: str, timeout: float = 25.0, quick: bool = False) -> dict | N
     cookie = _cookies_header()
     if cookie:
         headers["Cookie"] = cookie
-    attempts = 2 if quick else 4
+    attempts = 2 if quick else 6
     mirrored = False
     for attempt in range(attempts):
         try:
@@ -161,12 +161,12 @@ def _load_page(url: str, timeout: float = 25.0, quick: bool = False) -> dict | N
             return None
         if len(html) >= 50000:
             break
-        # Thin shell — retry after a short cooldown (TikTok alternates
-        # full page / login-wall shell per request).  In quick mode keep
-        # the wait tiny so the parallel walk stays fast.
+        # Thin shell — retry after a cooldown (TikTok alternates full page /
+        # login-wall shell per request; some IPs get long streaks of shells,
+        # so escalate patiently up to ~30s total instead of giving up fast).
         if attempt < attempts - 1:
             import time as _t
-            _t.sleep(0.6 if quick else 2.0 + attempt * 1.5)
+            _t.sleep(0.6 if quick else min(3.0 + attempt * 3.0, 12.0))
     else:
         log.info("Page %s stays a thin shell after retries — no rehydration data", url)
         return None
