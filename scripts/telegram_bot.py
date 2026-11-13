@@ -33,12 +33,24 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from dotenv import load_dotenv
+from postgrest import APIError
 from supabase import create_client, Client
 from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+# The project `.env` may carry a UTF-8 BOM (python-dotenv keeps the BOM in
+# the first key, making `EXPO_PUBLIC_SUPABASE_URL` invisible to os.getenv)
+# and the Supabase credentials are known under several names.  The shared
+# loader strips the BOM and mirrors the resolved values into every canonical
+# name, so both `SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_URL` work.
+try:
+    from _env import load_project_env  # noqa: E402
+except ImportError:  # pragma: no cover - direct execution from scripts/
+    from scripts._env import load_project_env  # type: ignore
+load_project_env()
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 # Mirror logs to a file so the bot stays debuggable when run detached
@@ -102,12 +114,20 @@ if __name__ == "__main__":
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SUPABASE_URL = os.getenv("EXPO_PUBLIC_SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY")
+# Accept every canonical spelling of the Supabase credentials; the shared
+# `_env.load_project_env()` above already mirrors them into one another.
+SUPABASE_URL = (os.getenv("SUPABASE_URL")
+                or os.getenv("EXPO_PUBLIC_SUPABASE_URL"))
+SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                or os.getenv("SUPABASE_KEY")
+                or os.getenv("EXPO_PUBLIC_SUPABASE_ANON_KEY"))
 VALID_GENRES = {"Sci-Fi", "Fantasy", "Romance", "Horror"}
 DEFAULT_GENRE = "Sci-Fi"
 
-DEFAULT_FREE_FIRST = 2
+# All episodes are locked by default — the "first 2 free" rule is removed.
+# Every episode becomes viewable only after being unlocked (ad reward /
+# entry credit).  Kept as 0 so `n <= DEFAULT_FREE_FIRST` is always False.
+DEFAULT_FREE_FIRST = 0
 
 # Hard cap per episode for the video-source/download step.  If a single
 # episode takes longer than this, it is skipped and the import continues
@@ -130,7 +150,7 @@ UPLOAD_WATCHDOG = 150.0
 # thumbnail + DB write, one after another) → a 50-episode series crawled
 # for ~30 min.  6 workers ≈ 50 episodes in 3-5 minutes; RAM stays bounded
 # because each worker holds at most ONE video's bytes (~10 MB).
-IMPORT_WORKERS = int(os.getenv("IMPORT_WORKERS", "10"))
+IMPORT_WORKERS = 1
 
 # Memory soft limit (MB).  Render's free container is killed at ~512 MB RSS;
 # parallel yt-dlp subprocesses + in-RAM video bytes can spike past that and
@@ -779,6 +799,10 @@ def _upload_media(series_id: str, ep_num: int, src_url: str, prefix: str, conten
         if e.response.status_code == 413 or "EntityTooLarge" in body:
             log.warning("POST too large for %s — retrying via TUS", remote_path)
             return _tus_upload(remote_path, content, content_type)
+        # 503 / "no healthy upstream" — let it propagate so the watchdog
+        # can retry with exponential backoff instead of silently returning "".
+        if e.response.status_code == 503 or "no healthy upstream" in body.lower():
+            raise
         log.warning("Storage upload failed for %s (HTTP %s): %s | body: %s",
                      remote_path, e.response.status_code, e, body)
         return ""
@@ -1096,18 +1120,7 @@ def _fetch_video(url: str, custom_title: str | None = None,
     """
     has_cookies = os.path.isfile(COOKIES_PATH)
 
-    # 1. TikWM API — fastest and currently the most reliable source.
-    if not skip_tikwm:
-        result = _fetch_video_tikwm(url, custom_title)
-        if result and result.get("video_url"):
-            return result
-
-    # 2. ssstik.io
-    result = _fetch_video_ssstik(url, custom_title)
-    if result and result.get("video_url"):
-        return result
-
-    # 3. yt-dlp (with cookies) — gives bytes directly
+    # 1. yt-dlp (with cookies) — most robust against rate-limiting.
     if has_cookies:
         result = _fetch_video_ytdlp(url, custom_title)
         if (
@@ -1115,8 +1128,6 @@ def _fetch_video(url: str, custom_title: str | None = None,
             and result.get("_video_bytes")
             and not _has_audio_stream(result["_video_bytes"])
         ):
-            # TikTok's own mp4 is occasionally video-only — drop the bytes so
-            # the chain continues to ssstik/tikwm for a properly muxed file.
             log.warning("yt-dlp bytes have NO audio for %s — trying next source", url)
             result.pop("_video_bytes", None)
         if result and result.get("_video_bytes"):
@@ -1124,12 +1135,23 @@ def _fetch_video(url: str, custom_title: str | None = None,
         if result:
             log.info("yt-dlp: URL only (no bytes) for %s", url)
 
-    # 4. Direct public URL: TikTok's own playAddr mp4, no processing.
+    # 2. TikWM API
+    if not skip_tikwm:
+        result = _fetch_video_tikwm(url, custom_title)
+        if result and result.get("video_url"):
+            return result
+
+    # 3. ssstik.io
+    result = _fetch_video_ssstik(url, custom_title)
+    if result and result.get("video_url"):
+        return result
+
+    # 4. Direct public URL
     result = _fetch_video_direct(url, custom_title)
     if result and result.get("video_url"):
         return result
 
-    # 5. Retry yt-dlp for URL-only fallback (if not tried yet)
+    # 5. yt-dlp without cookies — last resort
     if not has_cookies:
         result = _fetch_video_ytdlp(url, custom_title)
         if result:
@@ -1447,6 +1469,10 @@ class Store:
         if thumb:
             payload["poster_url"] = thumb
             payload["banner_url"] = thumb
+        else:
+            # Satisfy NOT NULL columns with empty string instead of NULL.
+            payload.setdefault("poster_url", "")
+            payload.setdefault("banner_url", "")
         self.db.table("series").upsert(payload, on_conflict="id").execute()
 
     def episode_exists(self, sid: str, num: int) -> bool:
@@ -1634,6 +1660,16 @@ class Store:
         except Exception as e:
             log.error("Marking EP %s of %s as pending failed: %s", num, sid, e)
 
+def bulk_upsert_pending(self, sid: str, rows: list[dict]) -> None:
+    """Upsert episode rows into DB, marking them as pending until download completes.
+    
+    This is safe to call multiple times - duplicate rows are auto-resolved via upsert.
+    After this call, episodes should be picked up by the download pipeline and
+    their status updated to 'ok' once videos are successfully uploaded.
+    """
+    for row in rows:
+        # Use upsert with on_conflict='id' to safely handle duplicates
+        self.db.table("episodes").upsert(row, on_conflict="id").execute()
     def bulk_upsert_pending(self, sid: str, rows: list[dict]) -> None:
         """Write many PENDING episode rows in ONE bulk upsert call, so the
         whole series appears in the DB instantly (the upload loop then fills
@@ -1792,7 +1828,7 @@ async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• Add custom text before/after the URL to set the title\n\n"
         "Titles like *Title EP.1* or *Title - Episode 2* are parsed into series + episode.\n"
         "Episodes without a number get sequential numbers.\n"
-        "First 2 episodes are marked free automatically.",
+        "All episodes are locked — unlock each by watching an ad.",
         parse_mode="Markdown",
     )
 
@@ -1993,7 +2029,41 @@ BATCH_LIMIT = 50
 # Parallel source-extraction: episodes are fetched FETCH_CONCURRENCY at a
 # time (the same batching the profile import already uses safely) — a
 # 50-episode series no longer runs source extraction one-by-one.
-FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "8"))
+FETCH_CONCURRENCY = 1
+
+# Ʒ³̵ (APIError 503 / "no healthy upstream") ê°¿ Įø¹ Įŋĳ 3-5 ³̵,
+# asyncio.sleep(3) å¿ú ç°ú¿û ºñ³²æ³¶ó.
+DB_RETRY_ATTEMPTS = 5
+DB_RETRY_BASE_DELAY = 3.0
+
+
+async def _retry_async_503(func, retries: int = DB_RETRY_ATTEMPTS,
+                           base_delay: float = 30.0,
+                           label: str = "call"):
+    """Async wrapper: retry *func* on APIError 503 ("no healthy upstream")
+    with a fixed 30-second delay on each retry.  *func* is a zero-arg
+    callable that returns an awaitable; a fresh
+    coroutine is created on every retry attempt so the same coroutine
+    is never awaited twice.  Non-503 errors are re-raised immediately."""
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await func()
+        except APIError as e:
+            last = e
+            status = getattr(e, "status", None) or getattr(e, "code", None)
+            msg = str(e).lower()
+            if status == 503 or "no healthy upstream" in msg:
+                if attempt < retries:
+                    wait = base_delay  # fixed 30s delay on 503
+                    log.warning("APIError 503%s — дахин оролдог (%d/%d) %.0fs…",
+                                f" [{label}]" if label else "", attempt, retries, wait)
+                    await asyncio.sleep(wait)
+                    continue
+            raise
+        except Exception:
+            raise
+    raise last
 
 
 async def _db_call(fn, *args, **kwargs):
@@ -2002,9 +2072,11 @@ async def _db_call(fn, *args, **kwargs):
     is the outer safety net).  Returns None on timeout — the callers'
     own guards treat it as a failure and move on."""
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(fn, *args, **kwargs),
-            timeout=DB_WATCHDOG,
+        return await _retry_async_503(
+            lambda: asyncio.wait_for(
+                asyncio.to_thread(fn, *args, **kwargs), timeout=DB_WATCHDOG
+            ),
+            label=getattr(fn, "__name__", "store_call"),
         )
     except asyncio.TimeoutError:
         log.error("DB call timed out after %.0fs: %s",
@@ -2022,13 +2094,17 @@ async def _rehost_poster(url: str, skey: str) -> str:
     (cacheControl=3600) even after a newer image is uploaded.  Returns the
     original URL unchanged when it's already ours or on failure."""
     def _sync(u: str) -> str:
+        print(f"[REHOST] candidate={u[:120]}")
         if not u or u.startswith(f"{SUPABASE_URL}/storage/v1/object/public/"):
+            print("[REHOST] already ours or empty -> skip")
             return u
         try:
             img = httpx.get(u, timeout=30, follow_redirects=True)
             ctype = img.headers.get("content-type", "image/jpeg")
+            print(f"[REHOST] download status={img.status_code} bytes={len(img.content)} ctype={ctype}")
             if (img.status_code != 200 or len(img.content) < 1000
                     or not ctype.startswith("image")):
+                print("[REHOST] download failed threshold")
                 return u
             ext = "png" if "png" in ctype else "jpg"
             path = f"{skey}/poster_{int(time.time())}.{ext}"
@@ -2038,13 +2114,14 @@ async def _rehost_poster(url: str, skey: str) -> str:
                          "Authorization": f"Bearer {SUPABASE_KEY or ''}",
                          "Content-Type": ctype, "x-upsert": "true"},
                 content=img.content, timeout=60)
+            print(f"[REHOST] storage status={r.status_code} body={r.text[:120]}")
             if r.status_code in (200, 201):
-                log.info("Poster re-hosted to Storage for %s (%dKB)",
-                         skey, len(img.content) // 1024)
+                print("[REHOST] success")
                 return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
             log.warning("Poster re-host failed (%s): %s",
                         r.status_code, r.text[:120])
         except Exception as e:
+            print(f"[REHOST] exception={e}")
             log.warning("Poster re-host crashed for %s: %s", skey, clean_error(e))
         return u
 
@@ -2078,10 +2155,13 @@ async def _upload_video_watchdog(store, skey: str, ep: int, src_url: str,
     the source link — that fallback is rejected here so callers queue the
     episode for retry instead of writing a doomed URL to the DB."""
     try:
-        url = await asyncio.wait_for(
-            asyncio.to_thread(store.upload_video, skey, ep, src_url,
-                              preloaded_bytes, alt_url),
-            timeout=UPLOAD_WATCHDOG,
+        url = await _retry_async_503(
+            lambda: asyncio.wait_for(
+                asyncio.to_thread(store.upload_video, skey, ep, src_url,
+                                  preloaded_bytes, alt_url),
+                timeout=UPLOAD_WATCHDOG,
+            ),
+            label=f"upload-{skey}-{ep}",
         )
     except asyncio.TimeoutError:
         log.error("Upload watchdog: EP %s of %s stalled > %.0fs — moving on",
@@ -2352,7 +2432,7 @@ async def _complete_series_pending_rows(skey: str, stitle: str,
     series takes minutes instead of an hour.  Never blocks the queue."""
     store = Store()
     done = 0
-    sem = asyncio.Semaphore(max(2, IMPORT_WORKERS))
+    sem = asyncio.Semaphore(max(1, IMPORT_WORKERS))
 
     async def _heal_one(r: dict) -> bool:
         ep = int(r.get("episode_number") or 0)
@@ -2818,6 +2898,52 @@ async def _background_series_import_impl(msg, episodes: list[dict], series_title
 # ── Insertion ───────────────────────────────────────────────────────────────
 
 async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
+    """Return the set of episode numbers that are fully healthy (have video_url + status ok)."""
+    # Get all episodes for this series
+    rows = await store.db.table("episodes").select("episode_number, status, video_url, source_url").eq("series_id", skey).execute()
+    episodes = rows.data or []
+    
+    healthy = set()
+    
+    for ep in episodes:
+        ep_num = ep.get("episode_number")
+        status = ep.get("status")
+        video_url = ep.get("video_url")
+        
+        # An episode is healthy if: status is 'ok' AND video_url is not empty
+        if status == "ok" and video_url:
+            healthy.add(ep_num)
+    
+    if limit:
+        # Only return up to limit episodes
+        all_healthy = list(healthy)[:limit]
+        return set(all_healthy)
+    
+    return healthy
+async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
+    """Return the set of episode numbers that are fully healthy (have video_url + status ok)."""
+    # Get all episodes for this series
+    rows = await store.db.table("episodes").select("episode_number, status, video_url, source_url").eq("series_id", skey).execute()
+    episodes = rows.data or []
+    
+    healthy = set()
+    
+    for ep in episodes:
+        ep_num = ep.get("episode_number")
+        status = ep.get("status")
+        video_url = ep.get("video_url")
+        
+        # An episode is healthy if: status is 'ok' AND video_url is not empty
+        if status == "ok" and video_url:
+            healthy.add(ep_num)
+    
+    if limit:
+        # Only return up to limit episodes
+        all_healthy = list(healthy)[:limit]
+        return set(all_healthy)
+    
+    return healthy
+async def _healthy_db_episodes(store: "Store", skey: str, limit: int | None = None) -> set[int]:
     """Distinct episode numbers 1..limit that are FULLY playable in the DB
     (real video_url, not pending, storage object healthy).  This is the
     single source of truth for the "гүйцсэн үү?" check — never a guess.
@@ -3125,17 +3251,8 @@ async def _insert(msg, videos: list[dict], force: bool = False,
             gc.collect()
             _log_memory(f"after EP {ep} of {stitle}")
 
-        if todo:
-            tasks = [asyncio.create_task(_process_one(v)) for v in todo]
-            for fut in asyncio.as_completed(tasks):
-                await fut
-                if done_count and (done_count % 5 == 0 or done_count == len(todo)):
-                    await _safe_edit(
-                        msg,
-                        f"📦 [{idx}/{total_groups}] *{stitle}* — "
-                        f"{done_count}/{len(todo)} анги байршуулж байна…",
-                        parse_mode="Markdown",
-                    )
+        for v in todo:
+            await _process_one(v)
 
     # ── Strict retry pass: re-download + re-upload every failed episode,
     #    up to MAX_UPLOAD_ATTEMPTS rounds.  Each attempt runs the full
@@ -3548,6 +3665,84 @@ def main() -> None:
             )
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
+
+
+def retry_episode(supabase, episode_id):
+    """Re-download a video for an episode whose URL has expired.
+
+    Steps:
+    1. Fetch the episode row to get source_url and current data
+    2. Use yt-dlp/ssstik to extract a fresh video URL from source_url
+    3. Update the video_url in Supabase
+    4. Return the new video data or None on failure
+    """
+    import yt_dlp
+
+    try:
+        # Fetch the episode to get source_url
+        result = supabase.table('episodes').select('*').eq('id', episode_id).single().execute()
+        if not result.data:
+            log.error('Episode %s not found', episode_id)
+            return None
+        ep = result.data
+
+        source_url = ep.get('source_url', '')
+        if not source_url:
+            log.error('Episode %s has no source_url', episode_id)
+            return None
+
+        log.info('Retrying episode %s from source: %s', episode_id, source_url[:80])
+
+        # Extract video info using yt-dlp (same logic as extract_tiktok)
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'format': 'bestvideo+bestaudio/best',
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(source_url, download=False)
+
+        video_url = info.get('url') or ''
+        if not video_url and info.get('formats'):
+            best = max(info['formats'], key=lambda f: f.get('height', 0) or 0)
+            video_url = best.get('url') or ''
+
+        title = (info.get('title') or ep['title']).strip()
+        title = re.sub(r'\s*[—\-–]*(♬.*|original sound.*|sonido original.*)$', '', title).strip()
+        if not title:
+            title = ep['title']
+
+        duration = max(1, round((info.get('duration') or ep['duration']) / 60))
+
+        thumbnail = info.get('thumbnail') or ep['thumbnail_url']
+
+        # Update the episode with new video URL
+        update_payload = {
+            'video_url': video_url,
+            'title': title,
+            'duration': duration,
+            'thumbnail_url': thumbnail,
+            'status': 'ok',
+        }
+        supabase.table('episodes').update(update_payload).eq('id', episode_id).execute()
+
+        log.info('Successfully retried episode %s: new video URL updated', episode_id)
+
+        return {
+            'title': title,
+            'video_url': video_url,
+            'thumbnail_url': thumbnail,
+            'duration': duration,
+        }
+    except Exception as e:
+        log.error('Failed to retry episode %s: %s', episode_id, clean_error(e))
+        # Mark episode as pending for manual re-download
+        try:
+            supabase.table('episodes').update({'status': 'pending'}).eq('id', episode_id).execute()
+        except Exception:
+            pass
+        return None
 
 
 if __name__ == "__main__":
